@@ -1,0 +1,26 @@
+[package]
+name = "tvek"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-dependency, ultra-fast RFC 8259 JSON linter and formatter"
+license = "MIT"
+readme = "README.md"
+
+[lib]
+name = "tvek"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tvek"
+path = "src/main.rs"
+
+[dependencies]
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

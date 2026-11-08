@@ -1,0 +1,18 @@
+# Rust / Cargo
+/target/
+
+# Python / Maturin
+/dist/
+/build/
+/.venv/
+/venv/
+__pycache__/
+*.egg-info/
+*.whl
+
+# IDE / OS
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+.*.tvek_tmp_*

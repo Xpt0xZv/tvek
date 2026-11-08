@@ -1,0 +1,353 @@
+use std::fmt;
+
+pub const MAX_SNIPPET_CHARS: usize = 120;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxError {
+    pub message: String,
+    pub offset: usize,
+    pub line: usize,
+    pub col: usize,
+}
+
+/// Returns true if `ch` is an unsafe terminal control, format, separator, or bidirectional
+/// override character (CWE-150 / CWE-116: ANSI/OSC escape injection, Trojan Source BiDi spoofing,
+/// Zl/Zp line-separator injection, and zero-width format characters — TVEK-05 / TVEK-09).
+#[inline]
+pub fn is_unsafe_terminal_char(ch: char, allow_tab: bool) -> bool {
+    if allow_tab && ch == '\t' {
+        return false;
+    }
+    if ch.is_control() {
+        return true;
+    }
+    matches!(
+        ch,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+    )
+}
+
+/// Sanitizes untrusted text before printing to stderr by replacing control characters
+/// and Unicode BiDi overrides with `\u{FFFD}` (``), preserving 1-to-1 character column width.
+pub fn sanitize_for_terminal(input: &str, allow_tab: bool) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if is_unsafe_terminal_char(ch, allow_tab) {
+            out.push('\u{FFFD}');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+impl SyntaxError {
+    pub fn new(message: impl Into<String>, offset: usize, input: &[u8]) -> Self {
+        let clamped = offset.min(input.len());
+        let mut line = 1usize;
+        let mut line_start = 0usize;
+
+        for (idx, &b) in input[..clamped].iter().enumerate() {
+            if b == b'\n' {
+                line += 1;
+                line_start = idx + 1;
+            }
+        }
+
+        // Exclude a trailing CR only if it is immediately part of a CRLF pair at `clamped`
+        let col_end = if clamped > line_start
+            && input[clamped - 1] == b'\r'
+            && input.get(clamped) == Some(&b'\n')
+        {
+            clamped - 1
+        } else {
+            clamped
+        };
+
+        let col_slice = &input[line_start..col_end];
+        let mut col = 1usize;
+        for chunk in col_slice.utf8_chunks() {
+            col += chunk.valid().chars().count();
+            if !chunk.invalid().is_empty() {
+                col += 1;
+            }
+        }
+
+        Self {
+            message: message.into(),
+            offset: clamped,
+            line,
+            col,
+        }
+    }
+
+    pub fn format_diagnostic(&self, filename: &str, input: &[u8]) -> String {
+        let clamped = self.offset.min(input.len());
+        let line_start = input[..clamped]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+
+        // Search forward only for `\n`, stripping a single trailing `\r` from `\r\n`
+        // so bare `\r` bytes earlier on the line do not truncate the snippet (IMP-01).
+        let line_end_nl = input[line_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| line_start + p)
+            .unwrap_or(input.len());
+        let line_end = if line_end_nl > line_start && input[line_end_nl - 1] == b'\r' {
+            line_end_nl - 1
+        } else {
+            line_end_nl
+        };
+
+        let raw_line = &input[line_start..line_end];
+        let safe_filename = sanitize_for_terminal(filename, false);
+        let safe_message = sanitize_for_terminal(&self.message, false);
+
+        // Window long lines around `target_idx` using `.utf8_chunks()` so even huge single-line
+        // inputs containing invalid UTF-8 never allocate a full-line String (IMP-01 / R-01).
+        let target_idx = self.col.saturating_sub(1);
+        let (rendered_line, caret_pad) = window_and_sanitize_line(raw_line, target_idx);
+
+        let line_num_str = self.line.to_string();
+        let gutter_pad = " ".repeat(line_num_str.len());
+
+        format!(
+            "error: {}\n{}--> {}:{}:{}\n{} |\n{} | {}\n{} | {}^",
+            safe_message,
+            gutter_pad,
+            safe_filename,
+            self.line,
+            self.col,
+            gutter_pad,
+            line_num_str,
+            rendered_line,
+            gutter_pad,
+            caret_pad
+        )
+    }
+}
+
+fn window_and_sanitize_line(raw_line: &[u8], target_idx: usize) -> (String, String) {
+    let half = MAX_SNIPPET_CHARS / 2;
+    let win_start = target_idx.saturating_sub(half);
+
+    // Stream via `.utf8_chunks()` and only collect characters up to `win_start + MAX_SNIPPET_CHARS + 1`
+    // so we never allocate a full-line String or Vec<char> on huge single-line inputs (R-01).
+    let mut window_chars: Vec<char> = Vec::with_capacity(MAX_SNIPPET_CHARS + 2);
+    let mut total_seen = 0usize;
+    let mut has_trailing_chars = false;
+
+    'chunks: for chunk in raw_line.utf8_chunks() {
+        for raw_ch in chunk.valid().chars() {
+            let safe_ch = if is_unsafe_terminal_char(raw_ch, true) {
+                '\u{FFFD}'
+            } else {
+                raw_ch
+            };
+            if total_seen >= win_start {
+                if window_chars.len() < MAX_SNIPPET_CHARS {
+                    window_chars.push(safe_ch);
+                } else {
+                    has_trailing_chars = true;
+                    break 'chunks;
+                }
+            }
+            total_seen += 1;
+        }
+
+        if !chunk.invalid().is_empty() {
+            if total_seen >= win_start {
+                if window_chars.len() < MAX_SNIPPET_CHARS {
+                    window_chars.push('\u{FFFD}');
+                } else {
+                    has_trailing_chars = true;
+                    break 'chunks;
+                }
+            }
+            total_seen += 1;
+        }
+    }
+
+    let has_leading_chars = win_start > 0;
+    let caret_in_window = target_idx.saturating_sub(win_start).min(window_chars.len());
+
+    let mut rendered_line = String::with_capacity(window_chars.len() + 6);
+    let mut caret_pad = String::with_capacity(caret_in_window + 3);
+
+    if has_leading_chars {
+        rendered_line.push_str("...");
+        caret_pad.push_str("   ");
+    }
+
+    for (i, &ch) in window_chars.iter().enumerate() {
+        rendered_line.push(ch);
+        if i < caret_in_window {
+            if ch == '\t' {
+                caret_pad.push('\t');
+            } else {
+                caret_pad.push(' ');
+            }
+        }
+    }
+
+    if has_trailing_chars {
+        rendered_line.push_str("...");
+    }
+
+    (rendered_line, caret_pad)
+}
+
+impl fmt::Display for SyntaxError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} (at line {}, column {}, byte {})",
+            sanitize_for_terminal(&self.message, false),
+            self.line,
+            self.col,
+            self.offset
+        )
+    }
+}
+
+impl std::error::Error for SyntaxError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tvek_05_terminal_escape_and_bidi_sanitization() {
+        let malicious_input = "{\"key\": \"\x1b[31m\x07\u{009B}\u{202E}\",}";
+        let err = SyntaxError::new(
+            "Trailing comma is not allowed in JSON object",
+            malicious_input.len() - 1,
+            malicious_input.as_bytes(),
+        );
+        let malicious_filename = "evil\x1b]0;pwned\x07\u{202E}.json";
+        let diag = err.format_diagnostic(malicious_filename, malicious_input.as_bytes());
+
+        assert!(!diag.contains('\x1b'));
+        assert!(!diag.contains('\x07'));
+        assert!(!diag.contains('\u{009B}'));
+        assert!(!diag.contains('\u{202E}'));
+        assert!(diag.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn test_imp_01_bare_cr_does_not_truncate_line() {
+        // Bare \r inside the line before the offending trailing comma at index 17
+        let input = b"{\"a\": 1,\r \"b\": 2,}";
+        let comma_offset = 16;
+        let err = SyntaxError::new(
+            "Trailing comma is not allowed in JSON object",
+            comma_offset,
+            input,
+        );
+        let diag = err.format_diagnostic("test.json", input);
+        let lines: Vec<&str> = diag.lines().collect();
+
+        // Line 4 is `1 | {"a": 1, "b": 2,}` and Line 5 is `  |                 ^`
+        assert!(lines[3].contains("\"b\": 2,}"));
+        let snippet_prefix = "1 | ";
+        let caret_prefix = "  | ";
+        let comma_char_pos = lines[3][snippet_prefix.len()..]
+            .chars()
+            .position(|c| c == '2')
+            .unwrap()
+            + 1;
+        let caret_char_pos = lines[4][caret_prefix.len()..]
+            .chars()
+            .position(|c| c == '^')
+            .unwrap();
+        assert_eq!(comma_char_pos, caret_char_pos);
+    }
+
+    #[test]
+    fn test_imp_01_invalid_utf8_column_alignment() {
+        // Invalid UTF-8 sequences (0xFF, 0xFE) before a syntax error on the same line
+        let input = b"{\"a\": \"\xFF\xFE\", !}";
+        let bang_offset = 12;
+        let err = SyntaxError::new("Unexpected token", bang_offset, input);
+        let diag = err.format_diagnostic("bad_utf8.json", input);
+        let lines: Vec<&str> = diag.lines().collect();
+
+        let snippet_char_pos = lines[3]["1 | ".len()..]
+            .chars()
+            .position(|c| c == '!')
+            .unwrap();
+        let caret_char_pos = lines[4]["  | ".len()..]
+            .chars()
+            .position(|c| c == '^')
+            .unwrap();
+        assert_eq!(snippet_char_pos, caret_char_pos);
+    }
+
+    #[test]
+    fn test_imp_01_long_minified_line_windowing() {
+        let mut long_line = String::from("{\"data\":\"");
+        for _ in 0..500 {
+            long_line.push('a');
+        }
+        long_line.push_str("\",}");
+        let comma_offset = long_line.len() - 2;
+
+        let err = SyntaxError::new(
+            "Trailing comma is not allowed in JSON object",
+            comma_offset,
+            long_line.as_bytes(),
+        );
+        let diag = err.format_diagnostic("minified.json", long_line.as_bytes());
+        let lines: Vec<&str> = diag.lines().collect();
+
+        // Snippet line must be windowed with leading "..." and bounded length
+        let snippet = &lines[3]["1 | ".len()..];
+        assert!(snippet.starts_with("..."));
+        assert!(snippet.chars().count() <= MAX_SNIPPET_CHARS + 6);
+
+        let comma_pos = snippet
+            .chars()
+            .enumerate()
+            .filter(|&(_, c)| c == ',')
+            .last()
+            .unwrap()
+            .0;
+        let caret_pos = lines[4]["  | ".len()..]
+            .chars()
+            .position(|c| c == '^')
+            .unwrap();
+        assert_eq!(comma_pos, caret_pos);
+    }
+
+    #[test]
+    fn test_tvek_09_unicode_format_and_separator_sanitization() {
+        // Test Zl/Zp (U+2028, U+2029) and zero-width format characters (U+200B, U+200D, U+2060, U+FEFF, U+FFF9..=U+FFFB)
+        let input = "{\"k\": \"a\u{2028}b\u{2029}c\u{200B}d\u{200D}e\u{2060}f\u{FEFF}g\u{FFF9}h\u{FFFB}\",}";
+        let comma_offset = input.len() - 2;
+        let err = SyntaxError::new(
+            "Trailing comma is not allowed in JSON object",
+            comma_offset,
+            input.as_bytes(),
+        );
+        let diag = err.format_diagnostic("bad\u{2028}\u{200B}name.json", input.as_bytes());
+
+        for forbidden in [
+            '\u{2028}', '\u{2029}', '\u{200B}', '\u{200D}', '\u{2060}', '\u{FEFF}', '\u{FFF9}',
+            '\u{FFFB}',
+        ] {
+            assert!(!diag.contains(forbidden));
+        }
+
+        // Ensure the diagnostic remains strictly 5 lines (no injected line breaks from U+2028/U+2029)
+        let lines: Vec<&str> = diag.lines().collect();
+        assert_eq!(lines.len(), 5);
+    }
+}
