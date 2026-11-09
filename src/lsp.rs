@@ -4,12 +4,17 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use crate::error::sanitize_for_terminal;
 use crate::lexer::{
     format_json_with_limit, lint_json_with_limit, FormatOptions, DEFAULT_MAX_INPUT_BYTES,
-    DEFAULT_MAX_OUTPUT_BYTES, MAX_DEPTH,
+    DEFAULT_MAX_OUTPUT_BYTES,
 };
 
 const MAX_HEADER_LINE_BYTES: usize = 4096;
 const MAX_HEADERS: usize = 32;
 const MAX_OPEN_DOCUMENTS: usize = 1024;
+const MAX_URI_BYTES: usize = 4096;
+const MAX_TOTAL_DOCUMENT_BYTES: usize = 256 * 1024 * 1024; // 256 MiB aggregate cap across open docs
+const MAX_FRAME_PREALLOC_BYTES: usize = 64 * 1024; // 64 KiB cap on initial frame buffer reservation
+const MAX_RPC_DEPTH: usize = 32;
+const MAX_RPC_NODES: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LspConfig {
@@ -57,10 +62,15 @@ pub fn run_server_loop<R: BufRead, W: Write>(
     writer: &mut W,
     mut config: LspConfig,
 ) -> io::Result<u8> {
+    let host_max_input_bytes = config.max_input_bytes.min(DEFAULT_MAX_INPUT_BYTES);
+    config.max_input_bytes = host_max_input_bytes;
+
     let mut documents: HashMap<String, String> = HashMap::new();
+    let mut total_open_bytes: usize = 0;
+    let mut initialized = false;
     let mut shutdown_requested = false;
 
-    while let Some(body) = read_lsp_frame(reader, config.max_input_bytes)? {
+    while let Some(body) = read_lsp_frame(reader, max_frame_size(config.max_input_bytes))? {
         let max_mem = compute_lsp_max_output_bytes(config.max_input_bytes);
         if lint_json_with_limit(&body, max_mem).is_err() {
             let err_resp =
@@ -106,10 +116,33 @@ pub fn run_server_loop<R: BufRead, W: Write>(
             continue;
         }
 
+        // TVEK-13: Enforce LSP 3.17 initialization lifecycle before processing requests or notifications
+        if !initialized && method_name != "initialize" {
+            if let Some(id_str) = id_raw {
+                let resp = format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"error":{{"code":-32002,"message":"Server not initialized"}}}}"#,
+                    id_str
+                );
+                write_lsp_frame(writer, &resp)?;
+            }
+            continue;
+        }
+
         match method_name {
             "initialize" => {
+                if initialized {
+                    if let Some(id_str) = id_raw {
+                        let resp = format!(
+                            r#"{{"jsonrpc":"2.0","id":{},"error":{{"code":-32600,"message":"Server is already initialized"}}}}"#,
+                            id_str
+                        );
+                        write_lsp_frame(writer, &resp)?;
+                    }
+                    continue;
+                }
+                initialized = true;
                 if let Some(init_opts) = params.and_then(|p| p.get_field("initializationOptions")) {
-                    apply_initialization_options(&mut config, init_opts);
+                    apply_initialization_options(&mut config, init_opts, host_max_input_bytes);
                 }
                 if let Some(id_str) = id_raw {
                     let resp = format!(
@@ -140,13 +173,14 @@ pub fn run_server_loop<R: BufRead, W: Write>(
                         td.get_field("uri").and_then(|v| v.as_str()),
                         td.get_field("text").and_then(|v| v.as_str()),
                     ) {
-                        if text.len() <= config.max_input_bytes
-                            && (documents.contains_key(uri)
-                                || documents.len() < MAX_OPEN_DOCUMENTS)
-                        {
-                            documents.insert(uri.to_string(), text.to_string());
-                            publish_diagnostics_for_doc(writer, uri, text, &config)?;
-                        }
+                        handle_document_update(
+                            writer,
+                            &mut documents,
+                            &mut total_open_bytes,
+                            uri,
+                            text,
+                            &config,
+                        )?;
                     }
                 }
             }
@@ -159,19 +193,19 @@ pub fn run_server_loop<R: BufRead, W: Write>(
                     let changes_opt = p.get_field("contentChanges").and_then(|v| v.as_array());
 
                     if let (Some(uri), Some(changes)) = (uri_opt, changes_opt) {
-                        // Use the latest full-document change text
                         if let Some(last_text) = changes
                             .iter()
                             .rev()
                             .find_map(|c| c.get_field("text").and_then(|v| v.as_str()))
                         {
-                            if last_text.len() <= config.max_input_bytes
-                                && (documents.contains_key(uri)
-                                    || documents.len() < MAX_OPEN_DOCUMENTS)
-                            {
-                                documents.insert(uri.to_string(), last_text.to_string());
-                                publish_diagnostics_for_doc(writer, uri, last_text, &config)?;
-                            }
+                            handle_document_update(
+                                writer,
+                                &mut documents,
+                                &mut total_open_bytes,
+                                uri,
+                                last_text,
+                                &config,
+                            )?;
                         }
                     }
                 }
@@ -182,9 +216,11 @@ pub fn run_server_loop<R: BufRead, W: Write>(
                     .and_then(|td| td.get_field("uri"))
                     .and_then(|v| v.as_str())
                 {
-                    documents.remove(uri);
-                    let clear_notif = build_publish_diagnostics_notification(uri, None);
-                    write_lsp_frame(writer, &clear_notif)?;
+                    if uri.len() <= MAX_URI_BYTES {
+                        evict_document(&mut documents, &mut total_open_bytes, uri);
+                        let clear_notif = build_publish_diagnostics_notification(uri, None);
+                        write_lsp_frame(writer, &clear_notif)?;
+                    }
                 }
             }
             "textDocument/formatting" => {
@@ -249,14 +285,12 @@ pub fn run_server_loop<R: BufRead, W: Write>(
                         }
                     }
                     Err(_) => {
-                        // Do not fail the formatting RPC when the buffer currently has syntax errors
                         let resp = format!(r#"{{"jsonrpc":"2.0","id":{},"result":[]}}"#, id_str);
                         write_lsp_frame(writer, &resp)?;
                     }
                 }
             }
             _ => {
-                // Unknown request with an ID receives MethodNotFound (-32601)
                 if let Some(id_str) = id_raw {
                     let resp = format!(
                         r#"{{"jsonrpc":"2.0","id":{},"error":{{"code":-32601,"message":"Method not found"}}}}"#,
@@ -271,6 +305,72 @@ pub fn run_server_loop<R: BufRead, W: Write>(
     Ok(if shutdown_requested { 0 } else { 1 })
 }
 
+fn evict_document(
+    documents: &mut HashMap<String, String>,
+    total_open_bytes: &mut usize,
+    uri: &str,
+) {
+    if let Some(old_text) = documents.remove(uri) {
+        let removed_cost = uri.len().saturating_add(old_text.len());
+        *total_open_bytes = total_open_bytes.saturating_sub(removed_cost);
+    }
+}
+
+/// Inserts or updates a document in the bounded store. If any resource limit is exceeded
+/// (`MAX_URI_BYTES`, `config.max_input_bytes`, `MAX_OPEN_DOCUMENTS`, or aggregate memory cap),
+/// evicts any stale cached entry for `uri` so subsequent `textDocument/formatting` requests
+/// never format stale text (TVEK-10 / TVEK-11).
+fn handle_document_update<W: Write>(
+    writer: &mut W,
+    documents: &mut HashMap<String, String>,
+    total_open_bytes: &mut usize,
+    uri: &str,
+    text: &str,
+    config: &LspConfig,
+) -> io::Result<()> {
+    if uri.len() > MAX_URI_BYTES {
+        return Ok(());
+    }
+
+    // Evict any prior version first so `total_open_bytes` reflects remaining documents
+    // and stale text is never retained if the new update is rejected (TVEK-11).
+    evict_document(documents, total_open_bytes, uri);
+
+    let max_aggregate = config
+        .max_input_bytes
+        .saturating_mul(2)
+        .min(MAX_TOTAL_DOCUMENT_BYTES)
+        .max(config.max_input_bytes);
+    let entry_cost = uri.len().saturating_add(text.len());
+
+    if text.len() > config.max_input_bytes
+        || documents.len() >= MAX_OPEN_DOCUMENTS
+        || total_open_bytes.saturating_add(entry_cost) > max_aggregate
+    {
+        let diag = (
+            0,
+            0,
+            0,
+            "Document exceeds maximum allowed size or open document capacity".to_string(),
+        );
+        let notif = build_publish_diagnostics_notification(uri, Some(diag));
+        return write_lsp_frame(writer, &notif);
+    }
+
+    *total_open_bytes = total_open_bytes.saturating_add(entry_cost);
+    documents.insert(uri.to_string(), text.to_string());
+    publish_diagnostics_for_doc(writer, uri, text, config)
+}
+
+fn max_frame_size(max_input_bytes: usize) -> usize {
+    // Allow JSON-RPC envelope + escaped document overhead up to 2x max_input_bytes + 64 KiB,
+    // capped at DEFAULT_MAX_OUTPUT_BYTES (256 MiB).
+    max_input_bytes
+        .saturating_mul(2)
+        .saturating_add(64 * 1024)
+        .min(DEFAULT_MAX_OUTPUT_BYTES)
+}
+
 fn compute_lsp_max_output_bytes(max_input_bytes: usize) -> usize {
     if max_input_bytes == DEFAULT_MAX_INPUT_BYTES {
         DEFAULT_MAX_OUTPUT_BYTES
@@ -279,7 +379,13 @@ fn compute_lsp_max_output_bytes(max_input_bytes: usize) -> usize {
     }
 }
 
-fn apply_initialization_options(config: &mut LspConfig, init_opts: &RpcValue) {
+/// Applies client `initializationOptions` while clamping `maxSize` so a client can never
+/// raise `max_input_bytes` above the host/CLI ceiling (TVEK-10).
+fn apply_initialization_options(
+    config: &mut LspConfig,
+    init_opts: &RpcValue,
+    host_max_input_bytes: usize,
+) {
     if let Some(sort_keys) = init_opts
         .get_field("sortKeys")
         .or_else(|| init_opts.get_field("sort_keys"))
@@ -296,7 +402,9 @@ fn apply_initialization_options(config: &mut LspConfig, init_opts: &RpcValue) {
         .and_then(|v| v.as_usize())
     {
         if max_size > 0 {
-            config.max_input_bytes = max_size;
+            config.max_input_bytes = max_size
+                .min(host_max_input_bytes)
+                .min(DEFAULT_MAX_INPUT_BYTES);
         }
     }
 }
@@ -330,8 +438,12 @@ fn publish_diagnostics_for_doc<W: Write>(
         Ok(()) => None,
         Err(err) => {
             let (line_0, char_0) = offset_to_utf16_position(text, err.offset);
-            let char_end = if err.offset < text.len() {
-                let ch_len = text[err.offset..]
+            let mut safe_off = err.offset.min(text.len());
+            while safe_off > 0 && !text.is_char_boundary(safe_off) {
+                safe_off -= 1;
+            }
+            let char_end = if safe_off < text.len() {
+                let ch_len = text[safe_off..]
                     .chars()
                     .next()
                     .map(|c| if c == '\n' || c == '\r' { 0 } else { c.len_utf16() })
@@ -378,6 +490,7 @@ fn build_publish_diagnostics_notification(
 }
 
 /// Converts a byte offset in `text` into 0-indexed LSP `(line, utf16_character)` coordinates.
+/// Safely snaps `byte_offset` down to the nearest valid UTF-8 character boundary so it can never panic (TVEK-13).
 pub fn offset_to_utf16_position(text: &str, byte_offset: usize) -> (usize, usize) {
     let clamped = byte_offset.min(text.len());
     let bytes = text.as_bytes();
@@ -391,7 +504,7 @@ pub fn offset_to_utf16_position(text: &str, byte_offset: usize) -> (usize, usize
         }
     }
 
-    let col_end = if clamped > line_start
+    let mut col_end = if clamped > line_start
         && bytes[clamped - 1] == b'\r'
         && bytes.get(clamped) == Some(&b'\n')
     {
@@ -399,6 +512,10 @@ pub fn offset_to_utf16_position(text: &str, byte_offset: usize) -> (usize, usize
     } else {
         clamped
     };
+
+    while col_end > line_start && !text.is_char_boundary(col_end) {
+        col_end -= 1;
+    }
 
     let line_prefix = &text[line_start..col_end];
     let utf16_col: usize = line_prefix.chars().map(|c| c.len_utf16()).sum();
@@ -410,7 +527,8 @@ fn end_position_utf16(text: &str) -> (usize, usize) {
     offset_to_utf16_position(text, text.len())
 }
 
-/// Reads a single `Content-Length` framed JSON-RPC message with strict header and body size caps.
+/// Reads a single `Content-Length` framed JSON-RPC message with strict header and body size caps,
+/// duplicate `Content-Length` rejection (TVEK-11), and incremental body allocation (TVEK-10).
 pub fn read_lsp_frame<R: BufRead>(
     reader: &mut R,
     max_body_bytes: usize,
@@ -464,6 +582,12 @@ pub fn read_lsp_frame<R: BufRead>(
 
         if let Some((name, val)) = header_str.split_once(':') {
             if name.trim().eq_ignore_ascii_case("Content-Length") {
+                if content_length.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Duplicate Content-Length header in LSP frame",
+                    ));
+                }
                 let len = val.trim().parse::<usize>().map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -491,8 +615,14 @@ pub fn read_lsp_frame<R: BufRead>(
         )
     })?;
 
-    let mut body = vec![0u8; len];
-    reader.read_exact(&mut body)?;
+    let mut body = Vec::with_capacity(len.min(MAX_FRAME_PREALLOC_BYTES));
+    (&mut *reader).take(len as u64).read_to_end(&mut body)?;
+    if body.len() != len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Unexpected EOF while reading LSP frame body",
+        ));
+    }
     Ok(Some(body))
 }
 
@@ -540,7 +670,7 @@ fn escape_json_string(s: &str, out: &mut String) {
     }
 }
 
-// --- Zero-Dependency Validated JSON-RPC Value Reader ---
+// --- Zero-Dependency Iterative & Bounded JSON-RPC Value Reader (TVEK-12) ---
 
 #[derive(Debug, Clone)]
 enum RpcValue {
@@ -608,9 +738,23 @@ fn serialize_rpc_value(val: &RpcValue) -> String {
     }
 }
 
+enum RpcBuildFrame {
+    Object {
+        entries: Vec<(String, RpcValue)>,
+        pending_key: String,
+    },
+    Array {
+        items: Vec<RpcValue>,
+    },
+}
+
 fn parse_rpc_value(input: &[u8]) -> Option<RpcValue> {
-    let mut parser = RpcParser { input, pos: 0 };
-    let val = parser.parse_value(0)?;
+    let mut parser = RpcParser {
+        input,
+        pos: 0,
+        nodes_parsed: 0,
+    };
+    let val = parser.parse_root()?;
     parser.skip_ws();
     if parser.pos != input.len() {
         return None;
@@ -621,9 +765,20 @@ fn parse_rpc_value(input: &[u8]) -> Option<RpcValue> {
 struct RpcParser<'a> {
     input: &'a [u8],
     pos: usize,
+    nodes_parsed: usize,
 }
 
 impl<'a> RpcParser<'a> {
+    #[inline]
+    fn charge_node(&mut self) -> Option<()> {
+        self.nodes_parsed = self.nodes_parsed.saturating_add(1);
+        if self.nodes_parsed > MAX_RPC_NODES {
+            None
+        } else {
+            Some(())
+        }
+    }
+
     fn skip_ws(&mut self) {
         while self.pos < self.input.len() {
             match self.input[self.pos] {
@@ -633,86 +788,138 @@ impl<'a> RpcParser<'a> {
         }
     }
 
-    fn parse_value(&mut self, depth: usize) -> Option<RpcValue> {
-        if depth > MAX_DEPTH {
-            return None;
-        }
-        self.skip_ws();
-        let b = *self.input.get(self.pos)?;
-        match b {
-            b'{' => self.parse_object(depth + 1),
-            b'[' => self.parse_array(depth + 1),
-            b'"' => self.parse_string().map(RpcValue::Str),
-            b't' => {
-                self.pos += 4;
-                Some(RpcValue::Bool(true))
-            }
-            b'f' => {
-                self.pos += 5;
-                Some(RpcValue::Bool(false))
-            }
-            b'n' => {
-                self.pos += 4;
-                Some(RpcValue::Null)
-            }
-            b'-' | b'0'..=b'9' => self.parse_number().map(RpcValue::Number),
-            _ => None,
-        }
-    }
+    /// Iterative JSON-RPC envelope parser bounded by `MAX_RPC_DEPTH` and `MAX_RPC_NODES` (TVEK-12).
+    fn parse_root(&mut self) -> Option<RpcValue> {
+        let mut stack: Vec<RpcBuildFrame> = Vec::with_capacity(16);
 
-    fn parse_object(&mut self, depth: usize) -> Option<RpcValue> {
-        self.pos += 1; // '{'
-        self.skip_ws();
-        let mut entries = Vec::new();
-        if *self.input.get(self.pos)? == b'}' {
-            self.pos += 1;
-            return Some(RpcValue::Object(entries));
-        }
-        loop {
+        'expect_val: loop {
             self.skip_ws();
-            let key = self.parse_string()?;
-            self.skip_ws();
-            if *self.input.get(self.pos)? != b':' {
-                return None;
-            }
-            self.pos += 1;
-            let val = self.parse_value(depth)?;
-            entries.push((key, val));
-            self.skip_ws();
-            match *self.input.get(self.pos)? {
-                b',' => self.pos += 1,
-                b'}' => {
-                    self.pos += 1;
-                    break;
+            let mut current_val = loop {
+                self.skip_ws();
+                let b = *self.input.get(self.pos)?;
+                match b {
+                    b'{' => {
+                        if stack.len() + 1 > MAX_RPC_DEPTH {
+                            return None;
+                        }
+                        self.charge_node()?;
+                        self.pos += 1;
+                        self.skip_ws();
+                        if *self.input.get(self.pos)? == b'}' {
+                            self.pos += 1;
+                            break RpcValue::Object(Vec::new());
+                        }
+                        let key = self.parse_string()?;
+                        self.skip_ws();
+                        if *self.input.get(self.pos)? != b':' {
+                            return None;
+                        }
+                        self.pos += 1;
+                        stack.push(RpcBuildFrame::Object {
+                            entries: Vec::new(),
+                            pending_key: key,
+                        });
+                    }
+                    b'[' => {
+                        if stack.len() + 1 > MAX_RPC_DEPTH {
+                            return None;
+                        }
+                        self.charge_node()?;
+                        self.pos += 1;
+                        self.skip_ws();
+                        if *self.input.get(self.pos)? == b']' {
+                            self.pos += 1;
+                            break RpcValue::Array(Vec::new());
+                        }
+                        stack.push(RpcBuildFrame::Array { items: Vec::new() });
+                    }
+                    b'"' => {
+                        self.charge_node()?;
+                        break RpcValue::Str(self.parse_string()?);
+                    }
+                    b't' => {
+                        self.charge_node()?;
+                        self.pos += 4;
+                        break RpcValue::Bool(true);
+                    }
+                    b'f' => {
+                        self.charge_node()?;
+                        self.pos += 5;
+                        break RpcValue::Bool(false);
+                    }
+                    b'n' => {
+                        self.charge_node()?;
+                        self.pos += 4;
+                        break RpcValue::Null;
+                    }
+                    b'-' | b'0'..=b'9' => {
+                        self.charge_node()?;
+                        break RpcValue::Number(self.parse_number()?);
+                    }
+                    _ => return None,
                 }
-                _ => return None,
-            }
-        }
-        Some(RpcValue::Object(entries))
-    }
+            };
 
-    fn parse_array(&mut self, depth: usize) -> Option<RpcValue> {
-        self.pos += 1; // '['
-        self.skip_ws();
-        let mut items = Vec::new();
-        if *self.input.get(self.pos)? == b']' {
-            self.pos += 1;
-            return Some(RpcValue::Array(items));
-        }
-        loop {
-            let val = self.parse_value(depth)?;
-            items.push(val);
-            self.skip_ws();
-            match *self.input.get(self.pos)? {
-                b',' => self.pos += 1,
-                b']' => {
-                    self.pos += 1;
-                    break;
+            while let Some(frame) = stack.last_mut() {
+                self.skip_ws();
+                match frame {
+                    RpcBuildFrame::Object {
+                        entries,
+                        pending_key,
+                    } => {
+                        let key = std::mem::take(pending_key);
+                        entries.push((key, current_val));
+                        match *self.input.get(self.pos)? {
+                            b',' => {
+                                self.pos += 1;
+                                self.skip_ws();
+                                let next_key = self.parse_string()?;
+                                self.skip_ws();
+                                if *self.input.get(self.pos)? != b':' {
+                                    return None;
+                                }
+                                self.pos += 1;
+                                if let Some(RpcBuildFrame::Object { pending_key, .. }) =
+                                    stack.last_mut()
+                                {
+                                    *pending_key = next_key;
+                                }
+                                continue 'expect_val;
+                            }
+                            b'}' => {
+                                self.pos += 1;
+                                if let Some(RpcBuildFrame::Object { entries, .. }) = stack.pop() {
+                                    current_val = RpcValue::Object(entries);
+                                } else {
+                                    unreachable!();
+                                }
+                            }
+                            _ => return None,
+                        }
+                    }
+                    RpcBuildFrame::Array { items } => {
+                        items.push(current_val);
+                        match *self.input.get(self.pos)? {
+                            b',' => {
+                                self.pos += 1;
+                                continue 'expect_val;
+                            }
+                            b']' => {
+                                self.pos += 1;
+                                if let Some(RpcBuildFrame::Array { items }) = stack.pop() {
+                                    current_val = RpcValue::Array(items);
+                                } else {
+                                    unreachable!();
+                                }
+                            }
+                            _ => return None,
+                        }
+                    }
                 }
-                _ => return None,
             }
+
+            return Some(current_val);
         }
-        Some(RpcValue::Array(items))
     }
 
     fn parse_number(&mut self) -> Option<String> {
@@ -840,7 +1047,6 @@ mod tests {
         let responses = read_all_frames(&writer);
         assert_eq!(responses.len(), 2);
 
-        // Response 1: InitializeResult
         assert_eq!(
             responses[0]
                 .get_field("result")
@@ -849,13 +1055,11 @@ mod tests {
                 .and_then(|v| v.as_bool()),
             Some(true)
         );
-        // Response 2: shutdown null result
         assert!(matches!(
             responses[1].get_field("result"),
             Some(RpcValue::Null)
         ));
 
-        // Also verify exit without prior shutdown returns exit code 1
         let uninit_exit = frame_msg(r#"{"jsonrpc":"2.0","method":"exit"}"#);
         let mut reader2 = Cursor::new(uninit_exit.into_bytes());
         let mut writer2 = Vec::new();
@@ -866,6 +1070,9 @@ mod tests {
     #[test]
     fn test_lsp_did_open_change_close_diagnostics() {
         let mut input_stream = String::new();
+        input_stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        ));
         // 1. Open document with UTF-16 astral emoji ("😀" = 2 UTF-16 code units) + trailing comma
         input_stream.push_str(&frame_msg(
             r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///test.json","languageId":"json","version":1,"text":"{\"😀\": 1,}"}}}"#,
@@ -883,11 +1090,11 @@ mod tests {
         let mut writer = Vec::new();
         let _ = run_server_loop(&mut reader, &mut writer, LspConfig::default()).unwrap();
 
-        let notifs = read_all_frames(&writer);
-        assert_eq!(notifs.len(), 3);
+        let frames = read_all_frames(&writer);
+        // Frame 0 is initialize response; Frames 1..=3 are publishDiagnostics notifications
+        assert_eq!(frames.len(), 4);
 
-        // Notification 1: publishDiagnostics with 1 error at UTF-16 column 8 (`{"` = 2 + `😀` = 2 + `": 1` = 4 -> col 8)
-        let diags_1 = notifs[0]
+        let diags_1 = frames[1]
             .get_field("params")
             .and_then(|p| p.get_field("diagnostics"))
             .and_then(|d| d.as_array())
@@ -901,16 +1108,14 @@ mod tests {
             .unwrap();
         assert_eq!(start_char, 8);
 
-        // Notification 2 (after valid didChange): diagnostics cleared (`[]`)
-        let diags_2 = notifs[1]
+        let diags_2 = frames[2]
             .get_field("params")
             .and_then(|p| p.get_field("diagnostics"))
             .and_then(|d| d.as_array())
             .unwrap();
         assert!(diags_2.is_empty());
 
-        // Notification 3 (after didClose): diagnostics cleared (`[]`)
-        let diags_3 = notifs[2]
+        let diags_3 = frames[3]
             .get_field("params")
             .and_then(|p| p.get_field("diagnostics"))
             .and_then(|d| d.as_array())
@@ -927,11 +1132,9 @@ mod tests {
         input_stream.push_str(&frame_msg(
             r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///fmt.json","languageId":"json","version":1,"text":"{\"b\":2,\"a\":1}"}}}"#,
         ));
-        // Format with 4 spaces
         input_stream.push_str(&frame_msg(
             r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///fmt.json"},"options":{"tabSize":4,"insertSpaces":true}}}"#,
         ));
-        // Format with tabs (insertSpaces: false)
         input_stream.push_str(&frame_msg(
             r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///fmt.json"},"options":{"tabSize":4,"insertSpaces":false}}}"#,
         ));
@@ -941,7 +1144,6 @@ mod tests {
         let _ = run_server_loop(&mut reader, &mut writer, LspConfig::default()).unwrap();
 
         let frames = read_all_frames(&writer);
-        // Frame 0: initialize response, Frame 1: didOpen diagnostics, Frame 2: 4-space format, Frame 3: tab format
         assert_eq!(frames.len(), 4);
 
         let edits_4 = frames[2]
@@ -970,5 +1172,123 @@ mod tests {
         let err = read_lsp_frame(&mut reader, 1024).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("exceeds maximum allowed size"));
+    }
+
+    #[test]
+    fn test_tvek_10_clamp_init_max_size_and_incremental_frame_read() {
+        // Host starts server with max_input_bytes = 1024. Client tries to escalate maxSize to 999_999_999.
+        let mut cfg = LspConfig {
+            sort_keys: false,
+            minify: false,
+            max_input_bytes: 1024,
+        };
+        let opts = parse_rpc_value(br#"{"maxSize": 999999999}"#).unwrap();
+        apply_initialization_options(&mut cfg, &opts, 1024);
+        assert_eq!(cfg.max_input_bytes, 1024);
+
+        // Client can still lower maxSize below the host ceiling
+        let opts_lower = parse_rpc_value(br#"{"maxSize": 512}"#).unwrap();
+        apply_initialization_options(&mut cfg, &opts_lower, 1024);
+        assert_eq!(cfg.max_input_bytes, 512);
+
+        // Truncated frame claiming a large Content-Length must fail with UnexpectedEof without OOM
+        let truncated_frame = "Content-Length: 50000000\r\n\r\n{}";
+        let mut reader = Cursor::new(truncated_frame.as_bytes());
+        let err = read_lsp_frame(&mut reader, 60_000_000).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn test_tvek_11_evict_stale_doc_on_rejected_did_change_and_reject_dup_content_length() {
+        // 1. Duplicate Content-Length header must be rejected
+        let dup_cl = "Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}";
+        let mut dup_reader = Cursor::new(dup_cl.as_bytes());
+        let dup_err = read_lsp_frame(&mut dup_reader, 1024).unwrap_err();
+        assert_eq!(dup_err.kind(), io::ErrorKind::InvalidData);
+        assert!(dup_err.to_string().contains("Duplicate Content-Length"));
+
+        // 2. When didChange exceeds max_input_bytes, stale cached document must be evicted
+        let small_cfg = LspConfig {
+            sort_keys: false,
+            minify: false,
+            max_input_bytes: 32,
+        };
+        let mut stream = String::new();
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        ));
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///a.json","languageId":"json","version":1,"text":"{\"a\":1}"}}}"#,
+        ));
+        // Send oversized didChange (> 32 bytes)
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///a.json","version":2},"contentChanges":[{"text":"{\"very_long_key_exceeding_32_byte_limit\": 1234567890}"}]}}"#,
+        ));
+        // Request formatting — must return empty edits `[]` rather than formatting stale `{"a":1}`
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///a.json"},"options":{"tabSize":2,"insertSpaces":true}}}"#,
+        ));
+
+        let mut reader = Cursor::new(stream.into_bytes());
+        let mut writer = Vec::new();
+        let _ = run_server_loop(&mut reader, &mut writer, small_cfg).unwrap();
+
+        let frames = read_all_frames(&writer);
+        // Frame 0: initialize, Frame 1: didOpen diag ([]), Frame 2: didChange size-error diag, Frame 3: formatting result ([])
+        assert_eq!(frames.len(), 4);
+        let fmt_edits = frames[3]
+            .get_field("result")
+            .and_then(|r| r.as_array())
+            .unwrap();
+        assert!(
+            fmt_edits.is_empty(),
+            "Formatting must not use stale document after rejected didChange"
+        );
+    }
+
+    #[test]
+    fn test_tvek_12_rpc_parser_depth_and_node_caps() {
+        // Nesting > MAX_RPC_DEPTH (32) in JSON-RPC envelope is rejected
+        let deep = "[".repeat(40) + &"]".repeat(40);
+        assert!(parse_rpc_value(deep.as_bytes()).is_none());
+
+        // Array with > MAX_RPC_NODES (10,000) elements in JSON-RPC envelope is rejected
+        let mut many_nodes = String::from("[0");
+        for _ in 0..10_005 {
+            many_nodes.push_str(",0");
+        }
+        many_nodes.push(']');
+        assert!(parse_rpc_value(many_nodes.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn test_tvek_13_utf8_char_boundary_safety_and_pre_initialize_check() {
+        // Calling offset_to_utf16_position with byte_offset inside a 4-byte UTF-8 sequence ("😀" = bytes 0..4)
+        // must never panic and must snap cleanly to the start of the character
+        let text = "😀hello";
+        for mid_offset in 1..4 {
+            assert_eq!(offset_to_utf16_position(text, mid_offset), (0, 0));
+        }
+        assert_eq!(offset_to_utf16_position(text, 4), (0, 2));
+
+        // Sending a request before `initialize` must return JSON-RPC error -32002 (ServerNotInitialized)
+        let mut stream = String::new();
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":99,"method":"textDocument/formatting","params":{}}"#,
+        ));
+        stream.push_str(&frame_msg(r#"{"jsonrpc":"2.0","method":"exit"}"#));
+
+        let mut reader = Cursor::new(stream.into_bytes());
+        let mut writer = Vec::new();
+        let code = run_server_loop(&mut reader, &mut writer, LspConfig::default()).unwrap();
+        assert_eq!(code, 1);
+
+        let frames = read_all_frames(&writer);
+        assert_eq!(frames.len(), 1);
+        let err_str = frames[0]
+            .get_field("error")
+            .and_then(|e| e.get_field("code"))
+            .map(serialize_rpc_value);
+        assert_eq!(err_str.as_deref(), Some("-32002"));
     }
 }
