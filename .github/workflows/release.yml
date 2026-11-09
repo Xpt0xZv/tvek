@@ -79,10 +79,10 @@ jobs:
             os: ubuntu-24.04-arm
             archive: tar.gz
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             archive: tar.gz
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
             archive: tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
@@ -193,16 +193,20 @@ jobs:
             release-assets/*.zip
             release-assets/SHA256SUMS
 
-      - name: Create GitHub Release and upload assets
+      - name: Create or update GitHub Release and upload assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          gh release create "$TAG_NAME" \
-            release-assets/* \
-            --verify-tag \
-            --generate-notes \
-            --title "$TAG_NAME"
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" release-assets/* --clobber
+          else
+            gh release create "$TAG_NAME" \
+              release-assets/* \
+              --verify-tag \
+              --generate-notes \
+              --title "$TAG_NAME"
+          fi
 
   build-wheels:
     name: Build Python Wheel (${{ matrix.target }} on ${{ matrix.os }})
@@ -227,10 +231,10 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             manylinux: musllinux_1_2
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             manylinux: auto
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
             manylinux: auto
           - os: windows-latest
