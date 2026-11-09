@@ -105,8 +105,7 @@ impl<'a> KeySet<'a> {
             KeySetStorage::Small(vec) => vec.clear(),
             KeySetStorage::Large(set) => {
                 if set.capacity() > MAX_POOLED_HASHSET_CAPACITY {
-                    self.storage =
-                        KeySetStorage::Small(Vec::with_capacity(SMALL_KEY_SET_LIMIT));
+                    self.storage = KeySetStorage::Small(Vec::with_capacity(SMALL_KEY_SET_LIMIT));
                 } else {
                     set.clear();
                 }
@@ -793,11 +792,7 @@ impl<'a> ParseEvents<'a> for SortedDomBuilder<'a> {
             Cow::Owned(s) => s.len(),
         };
         let entry_key_overhead = size_of::<SortedEntry<'a>>() - size_of::<SortedValue<'a>>();
-        self.charge_dom_bytes(
-            entry_key_overhead.saturating_add(owned_len),
-            key_pos,
-            input,
-        )?;
+        self.charge_dom_bytes(entry_key_overhead.saturating_add(owned_len), key_pos, input)?;
         if let Some(SortBuildFrame::Object { pending_key, .. }) = self.stack.last_mut() {
             *pending_key = (sort_key, key_slice, key_pos);
         }
@@ -952,10 +947,7 @@ impl<'a> Scanner<'a> {
                     let open_pos = self.pos;
                     let new_depth = events.depth() + 1;
                     if new_depth > MAX_DEPTH {
-                        return Err(self.err(
-                            "Maximum nesting depth of 512 exceeded",
-                            open_pos,
-                        ));
+                        return Err(self.err("Maximum nesting depth of 512 exceeded", open_pos));
                     }
                     self.pos += 1;
                     self.skip_whitespace();
@@ -971,13 +963,7 @@ impl<'a> Scanner<'a> {
                     }
 
                     let (key_slice, key_pos, colon_pos) = self.scan_key_and_colon()?;
-                    events.on_open_object(
-                        open_pos,
-                        key_slice,
-                        key_pos,
-                        colon_pos,
-                        self.input,
-                    )?;
+                    events.on_open_object(open_pos, key_slice, key_pos, colon_pos, self.input)?;
                     self.skip_whitespace();
                     if self.pos >= self.input.len() {
                         return Err(self.err("Expected JSON value after ':'", self.pos));
@@ -986,10 +972,7 @@ impl<'a> Scanner<'a> {
                     let open_pos = self.pos;
                     let new_depth = events.depth() + 1;
                     if new_depth > MAX_DEPTH {
-                        return Err(self.err(
-                            "Maximum nesting depth of 512 exceeded",
-                            open_pos,
-                        ));
+                        return Err(self.err("Maximum nesting depth of 512 exceeded", open_pos));
                     }
                     self.pos += 1;
                     self.skip_whitespace();
@@ -1035,20 +1018,13 @@ impl<'a> Scanner<'a> {
                                         comma_pos,
                                     ));
                                 }
-                                let (key_slice, key_pos, colon_pos) =
-                                    self.scan_key_and_colon()?;
+                                let (key_slice, key_pos, colon_pos) = self.scan_key_and_colon()?;
                                 events.on_object_next_key(
-                                    comma_pos,
-                                    key_slice,
-                                    key_pos,
-                                    colon_pos,
-                                    self.input,
+                                    comma_pos, key_slice, key_pos, colon_pos, self.input,
                                 )?;
                                 self.skip_whitespace();
                                 if self.pos >= self.input.len() {
-                                    return Err(
-                                        self.err("Expected JSON value after ':'", self.pos)
-                                    );
+                                    return Err(self.err("Expected JSON value after ':'", self.pos));
                                 }
                                 continue 'expect_value;
                             }
@@ -1091,9 +1067,7 @@ impl<'a> Scanner<'a> {
                                 events.on_close_array(close_pos, self.input)?;
                             }
                             _ => {
-                                return Err(
-                                    self.err("Expected ',' or ']' in JSON array", self.pos)
-                                );
+                                return Err(self.err("Expected ',' or ']' in JSON array", self.pos));
                             }
                         }
                     }
@@ -1130,15 +1104,9 @@ impl<'a> Scanner<'a> {
         }
         match self.input[self.pos] {
             b'"' => self.scan_string(),
-            b'\'' => Err(self.err(
-                "Single-quoted strings are not allowed in JSON",
-                self.pos,
-            )),
+            b'\'' => Err(self.err("Single-quoted strings are not allowed in JSON", self.pos)),
             b',' => Err(self.err("Unexpected comma in JSON object", self.pos)),
-            _ => Err(self.err(
-                "Object keys must be double-quoted strings",
-                self.pos,
-            )),
+            _ => Err(self.err("Object keys must be double-quoted strings", self.pos)),
         }
     }
 
@@ -1150,14 +1118,8 @@ impl<'a> Scanner<'a> {
             b't' => self.scan_literal(b"true", "Invalid literal, expected 'true'"),
             b'f' => self.scan_literal(b"false", "Invalid literal, expected 'false'"),
             b'n' => self.scan_literal(b"null", "Invalid literal, expected 'null'"),
-            b'\'' => Err(self.err(
-                "Single-quoted strings are not allowed in JSON",
-                self.pos,
-            )),
-            b'+' => Err(self.err(
-                "Leading '+' sign is not allowed in JSON numbers",
-                self.pos,
-            )),
+            b'\'' => Err(self.err("Single-quoted strings are not allowed in JSON", self.pos)),
+            b'+' => Err(self.err("Leading '+' sign is not allowed in JSON numbers", self.pos)),
             b'.' => Err(self.err(
                 "Leading decimal point is not allowed in JSON numbers",
                 self.pos,
@@ -1209,10 +1171,7 @@ impl<'a> Scanner<'a> {
             b'0' => {
                 self.pos += 1;
                 if self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
-                    return Err(self.err(
-                        "Leading zeros are not allowed in JSON numbers",
-                        start,
-                    ));
+                    return Err(self.err("Leading zeros are not allowed in JSON numbers", start));
                 }
             }
             b'1'..=b'9' => {
@@ -1280,9 +1239,8 @@ impl<'a> Scanner<'a> {
             // SWAR (u64) fast-path: skip 8 bytes at a time when all 8 bytes are plain ASCII
             // in 0x20..=0x7F and neither `"` (0x22) nor `\` (0x5C) (IMP-05).
             while self.pos + 8 <= self.input.len() {
-                let chunk = u64::from_ne_bytes(
-                    self.input[self.pos..self.pos + 8].try_into().unwrap(),
-                );
+                let chunk =
+                    u64::from_ne_bytes(self.input[self.pos..self.pos + 8].try_into().unwrap());
                 if is_plain_ascii_string_chunk(chunk) {
                     self.pos += 8;
                 } else {
@@ -1596,8 +1554,8 @@ fn decode_json_key_for_sort(raw: &[u8]) -> Cow<'_, str> {
                         i += 2; // skip `\u`
                         let low = parse_hex4_unchecked(&inner[i..i + 4]);
                         i += 4;
-                        let combined = 0x10000
-                            + (((code as u32 - 0xD800) << 10) | (low as u32 - 0xDC00));
+                        let combined =
+                            0x10000 + (((code as u32 - 0xD800) << 10) | (low as u32 - 0xDC00));
                         if let Some(ch) = char::from_u32(combined) {
                             out.push(ch);
                         }

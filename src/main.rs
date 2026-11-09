@@ -16,15 +16,17 @@ use tvek::lexer::{
 };
 use tvek::lsp::{run_stdio_server, LspConfig};
 
-const VERSION: &str = "tvek 0.1.0";
+const VERSION: &str = concat!("tvek ", env!("CARGO_PKG_VERSION"));
 const MAX_DIR_DEPTH: usize = 64;
 const MAX_DISCOVERED_FILES: usize = 100_000;
 const TEMP_FILE_MAX_ATTEMPTS: u32 = 64;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-const HELP_TEXT: &str = "\
-tvek 0.1.0
+const HELP_TEXT: &str = concat!(
+    "tvek ",
+    env!("CARGO_PKG_VERSION"),
+    "\n\
 Zero-dependency, ultra-fast RFC 8259 JSON linter and formatter
 
 USAGE:
@@ -54,7 +56,8 @@ EXIT CODES:
     0                        Success (all inputs valid and properly formatted)
     1                        Syntax error or formatting check failed
     2                        CLI usage error or file I/O error
-";
+"
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InputTarget {
@@ -169,9 +172,9 @@ where
                     let val_os = iter.next().ok_or_else(|| {
                         "Option '--indent' requires a numeric value <N>".to_string()
                     })?;
-                    let val = val_os.to_str().ok_or_else(|| {
-                        "Invalid non-UTF-8 value for '--indent'".to_string()
-                    })?;
+                    let val = val_os
+                        .to_str()
+                        .ok_or_else(|| "Invalid non-UTF-8 value for '--indent'".to_string())?;
                     cfg.format_opts.indent = parse_indent_value(val)?;
                     explicit_indent = true;
                 }
@@ -179,9 +182,9 @@ where
                     let val_os = iter.next().ok_or_else(|| {
                         "Option '--max-size' requires a byte limit <BYTES>".to_string()
                     })?;
-                    let val = val_os.to_str().ok_or_else(|| {
-                        "Invalid non-UTF-8 value for '--max-size'".to_string()
-                    })?;
+                    let val = val_os
+                        .to_str()
+                        .ok_or_else(|| "Invalid non-UTF-8 value for '--max-size'".to_string())?;
                     cfg.max_input_bytes = parse_max_size_value(val)?;
                 }
                 _ => return Err(format!("Unknown option '--{}'", long)),
@@ -189,8 +192,7 @@ where
         } else {
             // Short flags (may be combined, e.g. -ms or -i4)
             let shorts = &arg[1..];
-            let mut chars = shorts.char_indices().peekable();
-            while let Some((idx, ch)) = chars.next() {
+            for (idx, ch) in shorts.char_indices() {
                 match ch {
                     'c' => cfg.check = true,
                     'l' => cfg.lint = true,
@@ -254,8 +256,7 @@ where
         return Err("Options '--minify' and '--indent' cannot be used together".to_string());
     }
     if cfg.write
-        && (cfg.targets.is_empty()
-            || cfg.targets.iter().any(|t| matches!(t, InputTarget::Stdin)))
+        && (cfg.targets.is_empty() || cfg.targets.iter().any(|t| matches!(t, InputTarget::Stdin)))
     {
         return Err("Option '--write' cannot be used with stdin ('-')".to_string());
     }
@@ -272,9 +273,12 @@ fn os_arg_to_target(os_arg: OsString) -> InputTarget {
 }
 
 fn parse_indent_value(val: &str) -> Result<usize, String> {
-    let n = val
-        .parse::<usize>()
-        .map_err(|_| format!("Invalid indent value '{}': expected non-negative integer", val))?;
+    let n = val.parse::<usize>().map_err(|_| {
+        format!(
+            "Invalid indent value '{}': expected non-negative integer",
+            val
+        )
+    })?;
     if n > 64 {
         return Err(format!("Indent value '{}' is too large (maximum is 64)", n));
     }
@@ -312,11 +316,7 @@ fn write_stderr_line(msg: &str) {
 
 /// Iterative directory traversal with an explicit depth cap (`MAX_DIR_DEPTH`),
 /// file discovery cap (`MAX_DISCOVERED_FILES`), and resilient per-entry error reporting (TVEK-04 / TVEK-07).
-fn collect_json_files_in_dir(
-    root_dir: &Path,
-    out: &mut Vec<PathBuf>,
-    has_io_err: &mut bool,
-) {
+fn collect_json_files_in_dir(root_dir: &Path, out: &mut Vec<PathBuf>, has_io_err: &mut bool) {
     collect_json_files_in_dir_with_limit(root_dir, out, MAX_DISCOVERED_FILES, has_io_err);
 }
 
@@ -491,13 +491,27 @@ fn next_random_token(attempt: u32) -> u64 {
     x ^ (x >> 31)
 }
 
+/// Clears the read-only flag on `perms` without making the file world-writable on Unix.
+fn clear_readonly(perms: &mut fs::Permissions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = perms.mode();
+        perms.set_mode(mode | 0o200);
+    }
+    #[cfg(not(unix))]
+    {
+        perms.set_readonly(false);
+    }
+}
+
 /// Removes a temporary file, clearing read-only attributes first if necessary on Windows (IMP-03).
 fn remove_temp_file(path: &Path) {
     if fs::remove_file(path).is_err() {
         if let Ok(meta) = fs::symlink_metadata(path) {
             let mut perms = meta.permissions();
             if perms.readonly() {
-                perms.set_readonly(false);
+                clear_readonly(&mut perms);
                 let _ = fs::set_permissions(path, perms);
                 let _ = fs::remove_file(path);
             }
@@ -810,12 +824,7 @@ fn main() -> ExitCode {
         match target {
             InputTarget::Stdin => {
                 if !pending_files.is_empty() {
-                    process_file_batch(
-                        &pending_files,
-                        &cfg,
-                        &has_lint_or_check_err,
-                        &has_io_err,
-                    );
+                    process_file_batch(&pending_files, &cfg, &has_lint_or_check_err, &has_io_err);
                     pending_files.clear();
                 }
 
@@ -865,12 +874,7 @@ fn main() -> ExitCode {
     }
 
     if !pending_files.is_empty() {
-        process_file_batch(
-            &pending_files,
-            &cfg,
-            &has_lint_or_check_err,
-            &has_io_err,
-        );
+        process_file_batch(&pending_files, &cfg, &has_lint_or_check_err, &has_io_err);
     }
 
     if has_io_err.load(Ordering::Relaxed) {
@@ -1013,7 +1017,7 @@ mod tests {
         assert_eq!(entries, vec!["readonly.json"]);
 
         // R-03: Even if a read-only file is already formatted, `process_buffer` in `--write` mode must reject it
-        perms.set_readonly(false);
+        clear_readonly(&mut perms);
         fs::set_permissions(&target, perms.clone()).unwrap();
         let formatted_bytes = b"{\n  \"a\": 1\n}\n";
         fs::write(&target, formatted_bytes).unwrap();
@@ -1038,7 +1042,7 @@ mod tests {
         assert!(io_err.load(Ordering::Relaxed));
 
         // Restore write permission for cleanup
-        perms.set_readonly(false);
+        clear_readonly(&mut perms);
         let _ = fs::set_permissions(&target, perms);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1214,7 +1218,13 @@ mod tests {
             ParseAction::Server(LspConfig::default())
         );
         assert_eq!(
-            parse_args(vec!["server", "--sort-keys", "--minify", "--max-size=65536"]).unwrap(),
+            parse_args(vec![
+                "server",
+                "--sort-keys",
+                "--minify",
+                "--max-size=65536"
+            ])
+            .unwrap(),
             ParseAction::Server(LspConfig {
                 sort_keys: true,
                 minify: true,

@@ -21,6 +21,13 @@ classifiers = [
     "Topic :: Utilities",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Xpt0xZv/tvek"
+Repository = "https://github.com/Xpt0xZv/tvek"
+Issues = "https://github.com/Xpt0xZv/tvek/issues"
+Changelog = "https://github.com/Xpt0xZv/tvek/releases"
+
 [tool.maturin]
 bindings = "bin"
 strip = true
+locked = true
