@@ -14,6 +14,7 @@ use tvek::lexer::{
     format_json, format_json_with_limit, lint_json, lint_json_with_limit, FormatOptions,
     DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
 };
+use tvek::lsp::{run_stdio_server, LspConfig};
 
 const VERSION: &str = "tvek 0.1.0";
 const MAX_DIR_DEPTH: usize = 64;
@@ -28,9 +29,13 @@ Zero-dependency, ultra-fast RFC 8259 JSON linter and formatter
 
 USAGE:
     tvek [OPTIONS] [FILES_OR_DIRS...]
+    tvek server [OPTIONS]
 
 ARGS:
     [FILES_OR_DIRS...]       Files or directories to process (defaults to stdin '-')
+
+SUBCOMMANDS:
+    server                   Start the Language Server Protocol (LSP) server over stdio
 
 OPTIONS:
     -c, --check              Lint and verify formatting without modifying files
@@ -40,6 +45,7 @@ OPTIONS:
     -i, --indent <N>         Number of spaces per indentation level (default: 2; 0 for tab)
     -s, --sort-keys          Lexicographically sort object keys at every nesting level
         --max-size <BYTES>   Maximum input size in bytes (default: 104857600 / 100 MiB)
+        --lsp                Start the Language Server Protocol (LSP) server over stdio
     -q, --quiet              Suppress non-error output
     -v, --version            Print version information and exit
     -h, --help               Print this help message and exit
@@ -84,6 +90,7 @@ impl Default for CliConfig {
 #[derive(Debug, PartialEq, Eq)]
 enum ParseAction {
     Run(CliConfig),
+    Server(LspConfig),
     Help,
     Version,
 }
@@ -97,6 +104,7 @@ where
     let mut cfg = CliConfig::default();
     let mut positional_only = false;
     let mut explicit_indent = false;
+    let mut lsp_mode = false;
 
     while let Some(os_arg) = iter.next() {
         if positional_only {
@@ -126,6 +134,10 @@ where
         }
 
         if !arg.starts_with('-') {
+            if arg == "server" && cfg.targets.is_empty() && !lsp_mode {
+                lsp_mode = true;
+                continue;
+            }
             cfg.targets.push(InputTarget::Path(PathBuf::from(os_arg)));
             continue;
         }
@@ -150,6 +162,7 @@ where
                 "minify" => cfg.format_opts.minify = true,
                 "sort-keys" => cfg.format_opts.sort_keys = true,
                 "quiet" => cfg.quiet = true,
+                "lsp" => lsp_mode = true,
                 "version" => return Ok(ParseAction::Version),
                 "help" => return Ok(ParseAction::Help),
                 "indent" => {
@@ -208,6 +221,26 @@ where
                 }
             }
         }
+    }
+
+    if lsp_mode {
+        if cfg.check || cfg.lint || cfg.write || cfg.quiet || explicit_indent {
+            return Err(
+                "Options '--check', '--lint', '--write', '--quiet', and '--indent' cannot be used with 'tvek server' / '--lsp'"
+                    .to_string(),
+            );
+        }
+        if !cfg.targets.is_empty() {
+            return Err(
+                "File or directory arguments cannot be passed to 'tvek server' / '--lsp'"
+                    .to_string(),
+            );
+        }
+        return Ok(ParseAction::Server(LspConfig {
+            sort_keys: cfg.format_opts.sort_keys,
+            minify: cfg.format_opts.minify,
+            max_input_bytes: cfg.max_input_bytes,
+        }));
     }
 
     // ADR-01 / IMP-02: Validate mutually exclusive CLI flags and disallow --write with stdin
@@ -756,6 +789,9 @@ fn main() -> ExitCode {
             println!("{}", VERSION);
             return ExitCode::from(0);
         }
+        ParseAction::Server(lsp_cfg) => {
+            return ExitCode::from(run_stdio_server(lsp_cfg));
+        }
         ParseAction::Run(cfg) => cfg,
     };
 
@@ -1165,5 +1201,32 @@ mod tests {
         assert!(discovered_entry_cap.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_cli_server_subcommand_and_flag_validation() {
+        assert_eq!(
+            parse_args(vec!["server"]).unwrap(),
+            ParseAction::Server(LspConfig::default())
+        );
+        assert_eq!(
+            parse_args(vec!["--lsp"]).unwrap(),
+            ParseAction::Server(LspConfig::default())
+        );
+        assert_eq!(
+            parse_args(vec!["server", "--sort-keys", "--minify", "--max-size=65536"]).unwrap(),
+            ParseAction::Server(LspConfig {
+                sort_keys: true,
+                minify: true,
+                max_input_bytes: 65536,
+            })
+        );
+
+        // Invalid flag combinations with server mode must fail with usage error
+        assert!(parse_args(vec!["server", "--write"]).is_err());
+        assert!(parse_args(vec!["server", "--check"]).is_err());
+        assert!(parse_args(vec!["server", "--lint"]).is_err());
+        assert!(parse_args(vec!["server", "config.json"]).is_err());
+        assert!(parse_args(vec!["--lsp", "-w", "config.json"]).is_err());
     }
 }

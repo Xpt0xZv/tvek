@@ -37,6 +37,7 @@ uvx tvek --help
 
 ```text
 tvek [OPTIONS] [FILES_OR_DIRS...]
+tvek server [OPTIONS]
 ```
 
 ### Options
@@ -50,9 +51,22 @@ tvek [OPTIONS] [FILES_OR_DIRS...]
 | `-i, --indent <N>` | Number of spaces per indentation level (default: `2`; `0` uses `\t`) |
 | `-s, --sort-keys` | Lexicographically sort object keys at every nesting level |
 | `--max-size <BYTES>` | Maximum input size in bytes (default: `104857600` / 100 MiB) |
+| `--lsp` | Start the Language Server Protocol (LSP) server over stdio (alias for `tvek server`) |
 | `-q, --quiet` | Suppress non-error output |
 | `-v, --version` | Print `tvek 0.1.0` and exit `0` |
 | `-h, --help` | Print CLI help documentation and exit `0` |
+
+## Language Server (`tvek server`)
+
+`tvek` includes a built-in, zero-dependency Language Server Protocol (LSP) engine over `stdio` supporting real-time RFC 8259 diagnostics (`textDocument/publishDiagnostics`) and document formatting (`textDocument/formatting`).
+
+```bash
+tvek server
+# Or with default server-level options:
+tvek server --sort-keys --max-size 104857600
+```
+
+You can also pass `initializationOptions` (`{ "sortKeys": true, "minify": false, "maxSize": 104857600 }`) from your editor client.
 
 ### CLI Validation & Directory Discovery Rules
 
