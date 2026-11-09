@@ -1,0 +1,349 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+
+# Default to zero permissions; each job declares least-privilege permissions explicitly.
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  verify-release:
+    name: Verify Tag & Release Invariants
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.check_version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Validate tag against Cargo.toml and pyproject.toml
+        id: check_version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          TAG_VER="${REF_NAME#v}"
+          CARGO_VER=$(grep -E '^version = "' Cargo.toml | head -n1 | sed -E 's/version = "([^"]+)"/\1/')
+          PY_VER=$(grep -E '^version = "' pyproject.toml | head -n1 | sed -E 's/version = "([^"]+)"/\1/')
+
+          if [ "$TAG_VER" != "$CARGO_VER" ] || [ "$TAG_VER" != "$PY_VER" ]; then
+            echo "::error::Tag version ($TAG_VER) does not match Cargo.toml ($CARGO_VER) or pyproject.toml ($PY_VER)"
+            exit 1
+          fi
+
+          if [ -f build.rs ]; then
+            echo "::error::build.rs is not permitted!"
+            exit 1
+          fi
+
+          TREE_LINES=$(cargo tree --locked --target all --edges normal,build,dev --prefix none | sort -u | wc -l)
+          if [ "$TREE_LINES" -ne 1 ]; then
+            echo "::error::Zero-dependency invariant violated!"
+            cargo tree --locked --target all --edges normal,build,dev
+            exit 1
+          fi
+
+          echo "version=$TAG_VER" >> "$GITHUB_OUTPUT"
+
+      - name: Run full test suite before release
+        run: cargo test --locked --all-targets
+
+  build-binaries:
+    name: Build Binary (${{ matrix.target }})
+    needs: verify-release
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install musl tools (Linux musl target)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Add Rust target
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup target add "$TARGET"
+        shell: bash
+
+      - name: Build release binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$TARGET"
+        shell: bash
+
+      - name: Package Unix archive (.tar.gz)
+        if: matrix.archive == 'tar.gz'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          STAGE_DIR="tvek-${TARGET}"
+          mkdir -p "$STAGE_DIR" dist
+          cp "target/${TARGET}/release/tvek" "$STAGE_DIR/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$STAGE_DIR/"
+          tar -czf "dist/${STAGE_DIR}.tar.gz" "$STAGE_DIR"
+          cd dist
+          shasum -a 256 "${STAGE_DIR}.tar.gz" > "${STAGE_DIR}.tar.gz.sha256"
+        shell: bash
+
+      - name: Package Windows archive (.zip)
+        if: matrix.archive == 'zip'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $stageDir = "tvek-$env:TARGET"
+          New-Item -ItemType Directory -Force -Path $stageDir, dist | Out-Null
+          Copy-Item "target/$env:TARGET/release/tvek.exe" "$stageDir/"
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE "$stageDir/"
+          Compress-Archive -Path "$stageDir" -DestinationPath "dist/$stageDir.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/$stageDir.zip").Hash.ToLower()
+          "$hash  $stageDir.zip" | Out-File -Encoding ascii -NoNewline "dist/$stageDir.zip.sha256"
+          Add-Content -Encoding ascii -Path "dist/$stageDir.zip.sha256" -Value ""
+        shell: pwsh
+
+      - name: Upload release archive artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 5
+
+  publish-github-release:
+    name: Publish GitHub Release & SLSA Provenance
+    needs:
+      - verify-release
+      - build-binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.2.1
+        with:
+          pattern: binary-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate unified SHA256SUMS manifest
+        run: |
+          cd release-assets
+          cat *.sha256 | sort -k2 > SHA256SUMS
+          if [ "$(wc -l < SHA256SUMS)" -ne 7 ]; then
+            echo "::error::Expected 7 release archive checksums in SHA256SUMS, found $(wc -l < SHA256SUMS)"
+            exit 1
+          fi
+          sha256sum -c SHA256SUMS
+
+      - name: Attest SLSA Build Provenance for release archives
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            release-assets/*.tar.gz
+            release-assets/*.zip
+            release-assets/SHA256SUMS
+
+      - name: Create GitHub Release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG_NAME" \
+            release-assets/* \
+            --verify-tag \
+            --generate-notes \
+            --title "$TAG_NAME"
+
+  build-wheels:
+    name: Build Python Wheel (${{ matrix.target }} on ${{ matrix.os }})
+    needs: verify-release
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: 2_17
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: 2_17
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            manylinux: musllinux_1_2
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            manylinux: musllinux_1_2
+          - os: macos-13
+            target: x86_64-apple-darwin
+            manylinux: auto
+          - os: macos-14
+            target: aarch64-apple-darwin
+            manylinux: auto
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            manylinux: auto
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            manylinux: auto
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Build wheel via Maturin
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --locked
+          manylinux: ${{ matrix.manylinux }}
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wheel-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 5
+
+  build-sdist:
+    name: Build Python Source Distribution (sdist)
+    needs: verify-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Build sdist via Maturin
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wheel-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 5
+
+  publish-pypi:
+    name: Publish to PyPI (OIDC Trusted Publisher)
+    needs:
+      - verify-release
+      - build-wheels
+      - build-sdist
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/p/tvek
+    permissions:
+      id-token: write
+      attestations: write
+      contents: read
+    steps:
+      - name: Download all wheels and sdist
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.2.1
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: Attest SLSA Build Provenance for Python distributions
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: dist/*
+
+      - name: Publish distributions to PyPI via Trusted Publisher
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          attestations: true
+
+  publish-crates-io:
+    name: Publish to crates.io
+    needs:
+      - verify-release
+      - publish-github-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/tvek
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Publish crate to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not configured in the 'crates-io' environment."
+            exit 1
+          fi
+          cargo publish --locked

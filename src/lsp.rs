@@ -149,7 +149,9 @@ pub fn run_server_loop<R: BufRead, W: Write>(
                         concat!(
                             r#"{{"jsonrpc":"2.0","id":{},"result":{{"#,
                             r#""capabilities":{{"textDocumentSync":{{"openClose":true,"change":1}},"documentFormattingProvider":true}},"#,
-                            r#""serverInfo":{{"name":"tvek","version":"0.1.0"}}"#,
+                            r#""serverInfo":{{"name":"tvek","version":""#,
+                            env!("CARGO_PKG_VERSION"),
+                            r#""}}"#,
                             r#"}}}}"#
                         ),
                         id_str
@@ -446,7 +448,13 @@ fn publish_diagnostics_for_doc<W: Write>(
                 let ch_len = text[safe_off..]
                     .chars()
                     .next()
-                    .map(|c| if c == '\n' || c == '\r' { 0 } else { c.len_utf16() })
+                    .map(|c| {
+                        if c == '\n' || c == '\r' {
+                            0
+                        } else {
+                            c.len_utf16()
+                        }
+                    })
                     .unwrap_or(0);
                 char_0 + ch_len
             } else {
@@ -685,10 +693,12 @@ enum RpcValue {
 impl RpcValue {
     fn get_field(&self, key: &str) -> Option<&RpcValue> {
         match self {
-            RpcValue::Object(entries) => entries
-                .iter()
-                .rev()
-                .find_map(|(k, v)| if k == key { Some(v) } else { None }),
+            RpcValue::Object(entries) => {
+                entries
+                    .iter()
+                    .rev()
+                    .find_map(|(k, v)| if k == key { Some(v) } else { None })
+            }
             _ => None,
         }
     }
@@ -964,8 +974,8 @@ impl<'a> RpcParser<'a> {
                         if (0xD800..=0xDBFF).contains(&code) {
                             self.pos += 2; // skip `\u`
                             let low = self.read_hex4()?;
-                            let combined = 0x10000
-                                + (((code as u32 - 0xD800) << 10) | (low as u32 - 0xDC00));
+                            let combined =
+                                0x10000 + (((code as u32 - 0xD800) << 10) | (low as u32 - 0xDC00));
                             out.push(char::from_u32(combined)?);
                         } else {
                             out.push(char::from_u32(code as u32)?);
@@ -1040,8 +1050,7 @@ mod tests {
 
         let mut reader = Cursor::new(input_stream.into_bytes());
         let mut writer = Vec::new();
-        let exit_code =
-            run_server_loop(&mut reader, &mut writer, LspConfig::default()).unwrap();
+        let exit_code = run_server_loop(&mut reader, &mut writer, LspConfig::default()).unwrap();
         assert_eq!(exit_code, 0);
 
         let responses = read_all_frames(&writer);

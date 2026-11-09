@@ -1,0 +1,9 @@
+# Default code owner for all repository files
+* @Xpt0xZv
+
+# Security-critical workflows, policies, and package manifests
+/.github/ @Xpt0xZv
+/SECURITY.md @Xpt0xZv
+/Cargo.toml @Xpt0xZv
+/Cargo.lock @Xpt0xZv
+/pyproject.toml @Xpt0xZv

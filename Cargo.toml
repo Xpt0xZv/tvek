@@ -2,9 +2,22 @@
 name = "tvek"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.79"
 description = "Zero-dependency, ultra-fast RFC 8259 JSON linter and formatter"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+homepage = "https://github.com/Xpt0xZv/tvek"
+repository = "https://github.com/Xpt0xZv/tvek"
+keywords = ["json", "linter", "formatter", "cli", "lsp"]
+categories = ["command-line-utilities", "development-tools", "parser-implementations"]
+include = [
+    "/src/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+]
 
 [lib]
 name = "tvek"

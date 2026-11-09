@@ -1,0 +1,20 @@
+name: Feature Request
+description: Propose a capability or ergonomic improvement for tvek
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What workflow or use case are you trying to solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: How should `tvek` behave, including any CLI flags or LSP capabilities?
+    validations:
+      required: true
