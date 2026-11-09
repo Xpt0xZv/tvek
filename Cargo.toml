@@ -3,7 +3,7 @@ name = "tvek"
 version = "0.1.0"
 edition = "2021"
 description = "Zero-dependency, ultra-fast RFC 8259 JSON linter and formatter"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 readme = "README.md"
 
 [lib]

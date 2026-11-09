@@ -8,12 +8,13 @@ version = "0.1.0"
 description = "Zero-dependency, ultra-fast RFC 8259 JSON linter and formatter"
 readme = "README.md"
 requires-python = ">=3.8"
-license = { text = "MIT" }
+license = { text = "MIT OR Apache-2.0" }
 keywords = ["json", "linter", "formatter", "cli", "rust"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Rust",
     "Topic :: Software Development :: Quality Assurance",
