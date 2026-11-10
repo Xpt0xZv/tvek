@@ -1,12 +1,13 @@
 # tvek
 
-**tvek** is a zero-dependency, ultra-fast RFC 8259 JSON linter and formatter written in pure Rust (`std` only).
+**tvek** is a zero-dependency, ultra-fast RFC 8259 JSON and JSONC (JSON with Comments) linter and formatter written in pure Rust (`std` only).
 
 ## Features
 
 - **Zero External Dependencies**: Built exclusively with the Rust standard library (`std`)—no third-party crates.
-- **Single-Pass Streaming Byte Engine**: Validates RFC 8259 compliance and emits formatted output in a single byte-level pass (`&[u8]`) with 8-byte SWAR string scanning and pre-allocated indentation tables, without constructing an intermediate DOM/AST (unless `--sort-keys` is explicitly requested).
-- **Multi-Threaded Batch Processing**: Automatically scales across available CPU cores via `std::thread::scope` when linting, checking, or formatting multiple files in-place, with canonical path deduplication.
+- **Single-Pass Streaming Byte Engine**: Validates RFC 8259 / JSONC syntax and emits formatted output in a single byte-level pass (`&[u8]`) with 8-byte SWAR string scanning and pre-allocated indentation tables, without constructing an intermediate DOM/AST (unless `--sort-keys` is explicitly requested).
+- **First-Class JSONC (JSON with Comments) Support**: Preserves and re-indents single-line (`// ...`) and block (`/* ... */`) comments by default—including moving comments with their attached keys under `--sort-keys` and stripping them under `--minify`. Pass `--strict` (or `--no-comments`) to enforce strict comment-free RFC 8259 validation.
+- **Multi-Threaded Batch Processing**: Automatically discovers `.json` and `.jsonc` files and scales across available CPU cores via `std::thread::scope` when linting, checking, or formatting multiple files in-place, with canonical path deduplication.
 - **Strict RFC 8259 Compliance**:
   - Rejects UTF-8 byte order marks (`0xEF 0xBB 0xBF` BOM) at offset `0` with an explicit diagnostic per RFC 8259 §8.1.
   - Rejects trailing commas in objects and arrays.
@@ -47,9 +48,10 @@ tvek server [OPTIONS]
 | `-c, --check` | Lint and verify formatting without modifying files (exits `1` if unformatted or invalid) |
 | `-l, --lint` | Lint syntax only, ignoring whitespace/indentation differences |
 | `-w, --write` | Format files in-place atomically (only writes if formatted output differs) |
-| `-m, --minify` | Output compact single-line JSON with all insignificant whitespace stripped |
+| `-m, --minify` | Output compact single-line JSON with all insignificant whitespace and comments stripped |
 | `-i, --indent <N>` | Number of spaces per indentation level (default: `2`; `0` uses `\t`) |
 | `-s, --sort-keys` | Lexicographically sort object keys at every nesting level |
+| `--strict` | Enforce strict RFC 8259 JSON (disallow `//` and `/* */` comments; alias `--no-comments`) |
 | `--max-size <BYTES>` | Maximum input size in bytes (default: `104857600` / 100 MiB) |
 | `--lsp` | Start the Language Server Protocol (LSP) server over stdio (alias for `tvek server`) |
 | `-q, --quiet` | Suppress non-error output |
@@ -66,7 +68,7 @@ tvek server
 tvek server --sort-keys --max-size 104857600
 ```
 
-You can also pass `initializationOptions` (`{ "sortKeys": true, "minify": false, "maxSize": 104857600 }`) from your editor client.
+You can also pass `initializationOptions` (`{ "sortKeys": true, "minify": false, "strict": false, "maxSize": 104857600 }`) from your editor client.
 
 ### CLI Validation & Directory Discovery Rules
 
