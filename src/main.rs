@@ -1,9 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{self, ExitCode};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tvek::error::sanitize_for_terminal;
 use tvek::lexer::{
-    format_json, format_json_with_limit, lint_json, lint_json_with_limit, FormatOptions,
+    format_json, format_json_with_limit, lint_json_with_options, FormatOptions,
     DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
 };
 use tvek::lsp::{run_stdio_server, LspConfig};
@@ -19,6 +19,7 @@ use tvek::lsp::{run_stdio_server, LspConfig};
 const VERSION: &str = concat!("tvek ", env!("CARGO_PKG_VERSION"));
 const MAX_DIR_DEPTH: usize = 64;
 const MAX_DISCOVERED_FILES: usize = 100_000;
+const MAX_READ_PREALLOC_BYTES: usize = 16 * 1024 * 1024; // 16 MiB cap on file read pre-allocation
 const TEMP_FILE_MAX_ATTEMPTS: u32 = 64;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -27,7 +28,7 @@ const HELP_TEXT: &str = concat!(
     "tvek ",
     env!("CARGO_PKG_VERSION"),
     "\n\
-Zero-dependency, ultra-fast RFC 8259 JSON linter and formatter
+Zero-dependency, ultra-fast RFC 8259 JSON and JSONC linter and formatter
 
 USAGE:
     tvek [OPTIONS] [FILES_OR_DIRS...]
@@ -43,9 +44,10 @@ OPTIONS:
     -c, --check              Lint and verify formatting without modifying files
     -l, --lint               Lint syntax only (ignore whitespace/indentation differences)
     -w, --write              Format files in-place atomically when output differs
-    -m, --minify             Output compact single-line JSON with whitespace stripped
+    -m, --minify             Output compact single-line JSON with whitespace and comments stripped
     -i, --indent <N>         Number of spaces per indentation level (default: 2; 0 for tab)
     -s, --sort-keys          Lexicographically sort object keys at every nesting level
+        --strict             Enforce strict RFC 8259 JSON (disallow '//' and '/* */' comments)
         --max-size <BYTES>   Maximum input size in bytes (default: 104857600 / 100 MiB)
         --lsp                Start the Language Server Protocol (LSP) server over stdio
     -q, --quiet              Suppress non-error output
@@ -164,6 +166,7 @@ where
                 "write" => cfg.write = true,
                 "minify" => cfg.format_opts.minify = true,
                 "sort-keys" => cfg.format_opts.sort_keys = true,
+                "strict" | "no-comments" => cfg.format_opts.allow_comments = false,
                 "quiet" => cfg.quiet = true,
                 "lsp" => lsp_mode = true,
                 "version" => return Ok(ParseAction::Version),
@@ -241,6 +244,7 @@ where
         return Ok(ParseAction::Server(LspConfig {
             sort_keys: cfg.format_opts.sort_keys,
             minify: cfg.format_opts.minify,
+            allow_comments: cfg.format_opts.allow_comments,
             max_input_bytes: cfg.max_input_bytes,
         }));
     }
@@ -315,7 +319,8 @@ fn write_stderr_line(msg: &str) {
 }
 
 /// Iterative directory traversal with an explicit depth cap (`MAX_DIR_DEPTH`),
-/// file discovery cap (`MAX_DISCOVERED_FILES`), and resilient per-entry error reporting (TVEK-04 / TVEK-07).
+/// file discovery cap (`MAX_DISCOVERED_FILES`), `DirEntry::file_type()` fast-path (PERF-07),
+/// and resilient per-entry error reporting (TVEK-04 / TVEK-07).
 fn collect_json_files_in_dir(root_dir: &Path, out: &mut Vec<PathBuf>, has_io_err: &mut bool) {
     collect_json_files_in_dir_with_limit(root_dir, out, MAX_DISCOVERED_FILES, has_io_err);
 }
@@ -353,11 +358,14 @@ fn collect_json_files_in_dir_with_limit(
         };
 
         let max_dir_entries = max_files.saturating_mul(2).max(1);
-        let mut entries: Vec<PathBuf> = Vec::new();
+        let mut entry_count = 0usize;
+        let mut subdirs: Vec<PathBuf> = Vec::new();
+        let mut json_files: Vec<PathBuf> = Vec::new();
+
         for entry_res in read_dir {
             match entry_res {
                 Ok(entry) => {
-                    if entries.len() >= max_dir_entries {
+                    if entry_count >= max_dir_entries {
                         write_stderr_line(&format!(
                             "error: Directory entry limit ({}) exceeded in '{}'",
                             max_dir_entries,
@@ -366,7 +374,44 @@ fn collect_json_files_in_dir_with_limit(
                         *has_io_err = true;
                         return;
                     }
-                    entries.push(entry.path());
+                    entry_count += 1;
+
+                    let ft = match entry.file_type() {
+                        Ok(ft) => ft,
+                        Err(e) => {
+                            let path = entry.path();
+                            write_stderr_line(&format!(
+                                "error: Failed to inspect '{}': {}",
+                                sanitize_for_terminal(&path.to_string_lossy(), false),
+                                e
+                            ));
+                            *has_io_err = true;
+                            continue;
+                        }
+                    };
+
+                    if ft.is_symlink() {
+                        continue;
+                    }
+
+                    let file_name = entry.file_name();
+                    if ft.is_dir() {
+                        if let Some(name) = file_name.to_str() {
+                            if is_ignored_dir(name) {
+                                continue;
+                            }
+                        }
+                        subdirs.push(entry.path());
+                    } else if ft.is_file() {
+                        if let Some(ext) =
+                            Path::new(&file_name).extension().and_then(|e| e.to_str())
+                        {
+                            if ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("jsonc")
+                            {
+                                json_files.push(entry.path());
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     write_stderr_line(&format!(
@@ -378,54 +423,24 @@ fn collect_json_files_in_dir_with_limit(
                 }
             }
         }
-        entries.sort();
 
-        let mut subdirs: Vec<(PathBuf, usize)> = Vec::new();
-        for path in entries {
-            let meta = match fs::symlink_metadata(&path) {
-                Ok(m) => m,
-                Err(e) => {
-                    write_stderr_line(&format!(
-                        "error: Failed to inspect '{}': {}",
-                        sanitize_for_terminal(&path.to_string_lossy(), false),
-                        e
-                    ));
-                    *has_io_err = true;
-                    continue;
-                }
-            };
-
-            if meta.file_type().is_symlink() {
-                continue;
+        json_files.sort();
+        for path in json_files {
+            if out.len() >= max_files {
+                write_stderr_line(&format!(
+                    "error: Maximum discovered file limit ({}) exceeded in '{}'",
+                    max_files,
+                    sanitize_for_terminal(&root_dir.to_string_lossy(), false)
+                ));
+                *has_io_err = true;
+                return;
             }
-
-            if meta.is_dir() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if is_ignored_dir(name) {
-                        continue;
-                    }
-                }
-                subdirs.push((path, depth + 1));
-            } else if meta.is_file() {
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if ext.eq_ignore_ascii_case("json") {
-                        if out.len() >= max_files {
-                            write_stderr_line(&format!(
-                                "error: Maximum discovered file limit ({}) exceeded in '{}'",
-                                max_files,
-                                sanitize_for_terminal(&root_dir.to_string_lossy(), false)
-                            ));
-                            *has_io_err = true;
-                            return;
-                        }
-                        out.push(path);
-                    }
-                }
-            }
+            out.push(path);
         }
 
+        subdirs.sort();
         for subdir in subdirs.into_iter().rev() {
-            worklist.push(subdir);
+            worklist.push((subdir, depth + 1));
         }
     }
 }
@@ -433,8 +448,24 @@ fn collect_json_files_in_dir_with_limit(
 /// Bounded reader that reads at most `max_bytes` from `reader`, returning an error
 /// if the stream exceeds `max_bytes` (TVEK-02 / CWE-400).
 fn read_reader_bounded<R: Read>(reader: R, max_bytes: usize) -> io::Result<Vec<u8>> {
+    read_reader_bounded_with_hint(reader, max_bytes, None)
+}
+
+/// Bounded reader with an optional file-size capacity hint to eliminate geometric reallocations (PERF-06).
+fn read_reader_bounded_with_hint<R: Read>(
+    reader: R,
+    max_bytes: usize,
+    size_hint: Option<u64>,
+) -> io::Result<Vec<u8>> {
     let limit = (max_bytes as u64).saturating_add(1);
-    let mut buf = Vec::new();
+    let initial_cap = match size_hint {
+        Some(hint) => (hint as usize)
+            .min(max_bytes)
+            .min(MAX_READ_PREALLOC_BYTES)
+            .saturating_add(1),
+        None => 8192.min(max_bytes.saturating_add(1)),
+    };
+    let mut buf = Vec::with_capacity(initial_cap);
     reader.take(limit).read_to_end(&mut buf)?;
     if buf.len() > max_bytes {
         return Err(io::Error::new(
@@ -447,7 +478,7 @@ fn read_reader_bounded<R: Read>(reader: R, max_bytes: usize) -> io::Result<Vec<u
 
 /// Bounded file reader that opens the file handle first (eliminating path-based TOCTOU),
 /// verifies `meta.is_file()` (rejecting FIFOs, sockets, and device nodes), and enforces
-/// `max_bytes` (TVEK-02 / TVEK-07).
+/// `max_bytes` with single-allocation buffer reservation (TVEK-02 / TVEK-07 / PERF-06).
 fn read_file_bounded(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
     let file = fs::File::open(path)?;
     let meta = file.metadata()?;
@@ -457,17 +488,17 @@ fn read_file_bounded(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
             "Not a regular file",
         ));
     }
-    if meta.len() > max_bytes as u64 {
+    let file_len = meta.len();
+    if file_len > max_bytes as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "File size ({} bytes) exceeds maximum allowed size of {} bytes",
-                meta.len(),
-                max_bytes
+                file_len, max_bytes
             ),
         ));
     }
-    read_reader_bounded(file, max_bytes)
+    read_reader_bounded_with_hint(file, max_bytes, Some(file_len))
 }
 
 /// Generates a non-predictable 64-bit token mixing PID, system clock nanoseconds,
@@ -629,11 +660,8 @@ fn process_buffer(
     let safe_display = sanitize_for_terminal(display_name, false);
 
     if cfg.lint {
-        let res = if cfg.max_input_bytes == DEFAULT_MAX_INPUT_BYTES {
-            lint_json(input)
-        } else {
-            lint_json_with_limit(input, compute_max_output_bytes(cfg.max_input_bytes))
-        };
+        let max_mem = compute_max_output_bytes(cfg.max_input_bytes);
+        let res = lint_json_with_options(input, cfg.format_opts.allow_comments, max_mem);
         if let Err(err) = res {
             write_stderr_line(&err.format_diagnostic(&safe_display, input));
             has_lint_or_check_err.store(true, Ordering::Relaxed);
@@ -696,14 +724,126 @@ fn process_buffer(
     }
 }
 
-/// Deduplicates file paths by canonicalizing each path (with fallback to the original path)
-/// while preserving discovery order, preventing concurrent write races when duplicate or
-/// aliased paths are passed to `process_file_batch` (TVEK-06 / CWE-362).
+/// Lexically normalizes a path (resolving `.` and `..` against `current_dir` when relative)
+/// without performing per-file OS `realpath` / `GetFinalPathNameByHandleW` syscalls (INFO-01 / PERF-07 / TVEK-18).
+fn normalize_path_lexical(path: &Path, cwd: Option<&Path>) -> PathBuf {
+    let mut components: Vec<Component<'_>> = Vec::new();
+    let base_iter = if path.is_relative() {
+        cwd.map(|c| c.components())
+    } else {
+        None
+    };
+
+    for comp in base_iter.into_iter().flatten().chain(path.components()) {
+        match comp {
+            Component::Prefix(_) => {
+                components.clear();
+                components.push(comp);
+            }
+            Component::RootDir => {
+                if matches!(components.first(), Some(Component::Prefix(_))) {
+                    components.truncate(1);
+                } else {
+                    components.clear();
+                }
+                components.push(comp);
+            }
+            Component::CurDir => {}
+            Component::ParentDir => match components.last() {
+                Some(Component::Normal(_)) => {
+                    components.pop();
+                }
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                _ => {
+                    components.push(comp);
+                }
+            },
+            Component::Normal(_) => {
+                components.push(comp);
+            }
+        }
+    }
+
+    let mut out = PathBuf::new();
+    for comp in components {
+        out.push(comp.as_os_str());
+    }
+    out
+}
+
+#[inline]
+fn normalize_case_for_dedup(path: PathBuf) -> PathBuf {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        if let Some(s) = path.to_str() {
+            return PathBuf::from(s.to_lowercase());
+        }
+    }
+    path
+}
+
+#[inline]
+fn normalize_os_str_case(name: &OsStr) -> OsString {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        if let Some(s) = name.to_str() {
+            return OsString::from(s.to_lowercase());
+        }
+    }
+    name.to_os_string()
+}
+
+/// Deduplicates file paths while preserving discovery order, preventing concurrent write races
+/// when duplicate or aliased paths are passed to `process_file_batch` (TVEK-06 / INFO-01 / PERF-07 / TVEK-18).
+/// Caches `fs::canonicalize` per unique parent directory so large batches (> 64 files) resolve
+/// parent symlinks/junctions and case-insensitive aliases without O(N) `canonicalize` syscalls.
 fn deduplicate_files(files: &[PathBuf]) -> Vec<PathBuf> {
+    if files.len() <= 1 {
+        return files.to_vec();
+    }
+    let cwd = env::current_dir().ok();
+    let mut parent_cache: HashMap<PathBuf, (PathBuf, bool)> = HashMap::new();
     let mut seen = HashSet::with_capacity(files.len());
     let mut unique = Vec::with_capacity(files.len());
+
     for path in files {
-        let key = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        let key = if let Some(Component::Normal(file_name)) = path.components().next_back() {
+            let raw_parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let (canon_parent, parent_exists) = parent_cache
+                .entry(raw_parent.to_path_buf())
+                .or_insert_with(|| match fs::canonicalize(raw_parent) {
+                    Ok(canon) => (normalize_case_for_dedup(canon), true),
+                    Err(_) => (
+                        normalize_case_for_dedup(normalize_path_lexical(
+                            raw_parent,
+                            cwd.as_deref(),
+                        )),
+                        false,
+                    ),
+                })
+                .clone();
+
+            if parent_exists
+                && fs::symlink_metadata(path)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false)
+            {
+                match fs::canonicalize(path) {
+                    Ok(canon) => normalize_case_for_dedup(canon),
+                    Err(_) => canon_parent.join(normalize_os_str_case(file_name)),
+                }
+            } else {
+                canon_parent.join(normalize_os_str_case(file_name))
+            }
+        } else {
+            let resolved = fs::canonicalize(path)
+                .unwrap_or_else(|_| normalize_path_lexical(path, cwd.as_deref()));
+            normalize_case_for_dedup(resolved)
+        };
+
         if seen.insert(key) {
             unique.push(path.clone());
         }
@@ -714,14 +854,30 @@ fn deduplicate_files(files: &[PathBuf]) -> Vec<PathBuf> {
 /// Processes a slice of discovered files in parallel using `std::thread::scope` when
 /// multiple files are present and we are in a file-oriented mode (`--lint`, `--check`, `--write`),
 /// or sequentially when streaming formatted JSON to stdout so output order stays deterministic (IMP-07).
+#[cfg(test)]
 fn process_file_batch(
     files: &[PathBuf],
     cfg: &CliConfig,
     has_lint_or_check_err: &AtomicBool,
     has_io_err: &AtomicBool,
 ) {
-    let deduped = deduplicate_files(files);
-    let files = deduped.as_slice();
+    process_file_batch_with_dedup(files, true, cfg, has_lint_or_check_err, has_io_err);
+}
+
+fn process_file_batch_with_dedup(
+    files: &[PathBuf],
+    needs_dedup: bool,
+    cfg: &CliConfig,
+    has_lint_or_check_err: &AtomicBool,
+    has_io_err: &AtomicBool,
+) {
+    let deduped: Vec<PathBuf>;
+    let files = if needs_dedup && files.len() > 1 {
+        deduped = deduplicate_files(files);
+        deduped.as_slice()
+    } else {
+        files
+    };
     let can_parallelize = files.len() > 1 && (cfg.lint || cfg.check || cfg.write || cfg.quiet);
     let worker_count = if can_parallelize {
         thread::available_parallelism()
@@ -818,13 +974,26 @@ fn main() -> ExitCode {
         cfg.targets.clone()
     };
 
+    let path_target_count = targets
+        .iter()
+        .filter(|t| matches!(t, InputTarget::Path(_)))
+        .count();
+    // A single root path target walked without following symlinks is guaranteed duplicate-free (PERF-07).
+    let needs_dedup = path_target_count > 1;
+    let mut seen_root_dirs: HashSet<PathBuf> = HashSet::new();
     let mut pending_files: Vec<PathBuf> = Vec::new();
 
     for target in &targets {
         match target {
             InputTarget::Stdin => {
                 if !pending_files.is_empty() {
-                    process_file_batch(&pending_files, &cfg, &has_lint_or_check_err, &has_io_err);
+                    process_file_batch_with_dedup(
+                        &pending_files,
+                        needs_dedup,
+                        &cfg,
+                        &has_lint_or_check_err,
+                        &has_io_err,
+                    );
                     pending_files.clear();
                 }
 
@@ -861,6 +1030,13 @@ fn main() -> ExitCode {
                 };
 
                 if meta.is_dir() {
+                    if needs_dedup {
+                        if let Ok(canon_dir) = fs::canonicalize(path) {
+                            if !seen_root_dirs.insert(canon_dir) {
+                                continue;
+                            }
+                        }
+                    }
                     let mut dir_io_err = false;
                     collect_json_files_in_dir(path, &mut pending_files, &mut dir_io_err);
                     if dir_io_err {
@@ -874,7 +1050,13 @@ fn main() -> ExitCode {
     }
 
     if !pending_files.is_empty() {
-        process_file_batch(&pending_files, &cfg, &has_lint_or_check_err, &has_io_err);
+        process_file_batch_with_dedup(
+            &pending_files,
+            needs_dedup,
+            &cfg,
+            &has_lint_or_check_err,
+            &has_io_err,
+        );
     }
 
     if has_io_err.load(Ordering::Relaxed) {
@@ -1067,6 +1249,7 @@ mod tests {
                 minify: false,
                 indent: 2,
                 sort_keys: true,
+                allow_comments: true,
             },
             targets: Vec::new(),
         };
@@ -1150,6 +1333,7 @@ mod tests {
                 minify: false,
                 indent: 2,
                 sort_keys: true,
+                allow_comments: true,
             },
             targets: Vec::new(),
         };
@@ -1222,12 +1406,14 @@ mod tests {
                 "server",
                 "--sort-keys",
                 "--minify",
+                "--strict",
                 "--max-size=65536"
             ])
             .unwrap(),
             ParseAction::Server(LspConfig {
                 sort_keys: true,
                 minify: true,
+                allow_comments: false,
                 max_input_bytes: 65536,
             })
         );
@@ -1238,5 +1424,82 @@ mod tests {
         assert!(parse_args(vec!["server", "--lint"]).is_err());
         assert!(parse_args(vec!["server", "config.json"]).is_err());
         assert!(parse_args(vec!["--lsp", "-w", "config.json"]).is_err());
+    }
+
+    #[test]
+    fn test_jsonc_directory_discovery_and_lsp() {
+        let dir = create_temp_test_dir("jsonc_discovery");
+        let json_path = dir.join("a.json");
+        let jsonc_path = dir.join("b.jsonc");
+        fs::write(&json_path, b"// comment\n{\"a\": 1}\n").unwrap();
+        fs::write(&jsonc_path, b"/* block */\n{\"b\": 2}\n").unwrap();
+
+        let mut discovered = Vec::new();
+        let mut has_io_err = false;
+        collect_json_files_in_dir(&dir, &mut discovered, &mut has_io_err);
+        assert!(!has_io_err);
+        assert_eq!(discovered, vec![json_path.clone(), jsonc_path.clone()]);
+
+        // Default mode allows comments in .json and .jsonc
+        let default_cfg = CliConfig {
+            lint: true,
+            quiet: true,
+            ..CliConfig::default()
+        };
+        let lint_err = AtomicBool::new(false);
+        let io_err = AtomicBool::new(false);
+        process_file_batch(&discovered, &default_cfg, &lint_err, &io_err);
+        assert!(!lint_err.load(Ordering::Relaxed));
+        assert!(!io_err.load(Ordering::Relaxed));
+
+        // --strict (--no-comments) rejects comments
+        let act = parse_args(vec!["--lint", "--strict", "b.jsonc"]).unwrap();
+        match act {
+            ParseAction::Run(strict_cfg) => {
+                assert!(!strict_cfg.format_opts.allow_comments);
+                let strict_lint_err = AtomicBool::new(false);
+                process_file_batch(&discovered, &strict_cfg, &strict_lint_err, &io_err);
+                assert!(strict_lint_err.load(Ordering::Relaxed));
+            }
+            _ => panic!("Expected Run"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tvek_18_windows_drive_prefix_and_parent_cached_dedup() {
+        // 1. Verify normalize_path_lexical preserves Windows drive/UNC prefixes across RootDir
+        #[cfg(windows)]
+        {
+            let p_c = normalize_path_lexical(Path::new(r"C:\project\a.json"), None);
+            let p_d = normalize_path_lexical(Path::new(r"D:\project\a.json"), None);
+            assert_ne!(p_c, p_d);
+            assert_eq!(p_c, PathBuf::from(r"C:\project\a.json"));
+            assert_eq!(p_d, PathBuf::from(r"D:\project\a.json"));
+        }
+
+        // 2. Verify deduplicate_files resolves aliased parent paths even when batch exceeds 64 files
+        let dir = create_temp_test_dir("tvek_18_large_batch");
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+
+        let mut files = Vec::new();
+        for i in 0..70 {
+            let p = dir.join(format!("file_{:02}.json", i));
+            fs::write(&p, b"{\"a\":1}\n").unwrap();
+            files.push(p);
+        }
+        // Add an alias via `sub/..` to `file_00.json` inside a batch > 64 files
+        files.push(sub.join("..").join("file_00.json"));
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            files.push(dir.join("FILE_00.JSON"));
+        }
+
+        let deduped = deduplicate_files(&files);
+        assert_eq!(deduped.len(), 70);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

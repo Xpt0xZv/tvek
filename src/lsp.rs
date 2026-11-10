@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Read, Write};
 
 use crate::error::sanitize_for_terminal;
 use crate::lexer::{
-    format_json_with_limit, lint_json_with_limit, FormatOptions, DEFAULT_MAX_INPUT_BYTES,
-    DEFAULT_MAX_OUTPUT_BYTES,
+    format_json_with_limit, is_ident_continue, is_plain_ascii_string_chunk, lint_json_with_options,
+    FormatOptions, DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
 };
 
 const MAX_HEADER_LINE_BYTES: usize = 4096;
@@ -20,6 +20,7 @@ const MAX_RPC_NODES: usize = 10_000;
 pub struct LspConfig {
     pub sort_keys: bool,
     pub minify: bool,
+    pub allow_comments: bool,
     pub max_input_bytes: usize,
 }
 
@@ -28,6 +29,7 @@ impl Default for LspConfig {
         Self {
             sort_keys: false,
             minify: false,
+            allow_comments: true,
             max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
         }
     }
@@ -71,14 +73,6 @@ pub fn run_server_loop<R: BufRead, W: Write>(
     let mut shutdown_requested = false;
 
     while let Some(body) = read_lsp_frame(reader, max_frame_size(config.max_input_bytes))? {
-        let max_mem = compute_lsp_max_output_bytes(config.max_input_bytes);
-        if lint_json_with_limit(&body, max_mem).is_err() {
-            let err_resp =
-                r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#;
-            write_lsp_frame(writer, err_resp)?;
-            continue;
-        }
-
         let Some(msg) = parse_rpc_value(&body) else {
             let err_resp =
                 r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#;
@@ -148,7 +142,7 @@ pub fn run_server_loop<R: BufRead, W: Write>(
                     let resp = format!(
                         concat!(
                             r#"{{"jsonrpc":"2.0","id":{},"result":{{"#,
-                            r#""capabilities":{{"textDocumentSync":{{"openClose":true,"change":1}},"documentFormattingProvider":true}},"#,
+                            r#""capabilities":{{"textDocumentSync":{{"openClose":true,"change":2}},"documentFormattingProvider":true}},"#,
                             r#""serverInfo":{{"name":"tvek","version":""#,
                             env!("CARGO_PKG_VERSION"),
                             r#""}}"#,
@@ -195,20 +189,14 @@ pub fn run_server_loop<R: BufRead, W: Write>(
                     let changes_opt = p.get_field("contentChanges").and_then(|v| v.as_array());
 
                     if let (Some(uri), Some(changes)) = (uri_opt, changes_opt) {
-                        if let Some(last_text) = changes
-                            .iter()
-                            .rev()
-                            .find_map(|c| c.get_field("text").and_then(|v| v.as_str()))
-                        {
-                            handle_document_update(
-                                writer,
-                                &mut documents,
-                                &mut total_open_bytes,
-                                uri,
-                                last_text,
-                                &config,
-                            )?;
-                        }
+                        handle_document_changes(
+                            writer,
+                            &mut documents,
+                            &mut total_open_bytes,
+                            uri,
+                            changes,
+                            &config,
+                        )?;
                     }
                 }
             }
@@ -256,6 +244,7 @@ pub fn run_server_loop<R: BufRead, W: Write>(
                     minify: config.minify,
                     indent,
                     sort_keys: config.sort_keys,
+                    allow_comments: config.allow_comments,
                 };
 
                 let max_out = compute_lsp_max_output_bytes(config.max_input_bytes);
@@ -311,10 +300,13 @@ fn evict_document(
     documents: &mut HashMap<String, String>,
     total_open_bytes: &mut usize,
     uri: &str,
-) {
+) -> Option<String> {
     if let Some(old_text) = documents.remove(uri) {
         let removed_cost = uri.len().saturating_add(old_text.len());
         *total_open_bytes = total_open_bytes.saturating_sub(removed_cost);
+        Some(old_text)
+    } else {
+        None
     }
 }
 
@@ -336,7 +328,7 @@ fn handle_document_update<W: Write>(
 
     // Evict any prior version first so `total_open_bytes` reflects remaining documents
     // and stale text is never retained if the new update is rejected (TVEK-11).
-    evict_document(documents, total_open_bytes, uri);
+    let _ = evict_document(documents, total_open_bytes, uri);
 
     let max_aggregate = config
         .max_input_bytes
@@ -362,6 +354,140 @@ fn handle_document_update<W: Write>(
     *total_open_bytes = total_open_bytes.saturating_add(entry_cost);
     documents.insert(uri.to_string(), text.to_string());
     publish_diagnostics_for_doc(writer, uri, text, config)
+}
+
+/// Applies a sequence of full or incremental (`textDocumentSync: 2`) content changes to `uri` in-place
+/// while enforcing `config.max_input_bytes`, `MAX_OPEN_DOCUMENTS`, and `MAX_TOTAL_DOCUMENT_BYTES`
+/// (PERF-03 / TVEK-10 / TVEK-11 / TVEK-19).
+fn handle_document_changes<W: Write>(
+    writer: &mut W,
+    documents: &mut HashMap<String, String>,
+    total_open_bytes: &mut usize,
+    uri: &str,
+    changes: &[RpcValue],
+    config: &LspConfig,
+) -> io::Result<()> {
+    if uri.len() > MAX_URI_BYTES || changes.is_empty() {
+        return Ok(());
+    }
+
+    // Remove the document from `documents` first so `total_open_bytes` reflects other open documents
+    // and any rejected change leaves the stale document evicted (TVEK-11 / TVEK-19).
+    let mut doc_opt = evict_document(documents, total_open_bytes, uri);
+
+    for change in changes {
+        let Some(new_text) = change.get_field("text").and_then(|v| v.as_str()) else {
+            return Ok(());
+        };
+        let range = change.get_field("range");
+        let doc = match (range, doc_opt.as_mut()) {
+            (Some(_), None) => {
+                // Reject relative range edits when the document was never opened or was evicted (TVEK-19).
+                return Ok(());
+            }
+            (Some(_), Some(existing)) => existing,
+            (None, _) => doc_opt.get_or_insert_with(String::new),
+        };
+        if !apply_incremental_change(doc, range, new_text, config.max_input_bytes) {
+            let diag = (
+                0,
+                0,
+                0,
+                "Document exceeds maximum allowed size or open document capacity".to_string(),
+            );
+            let notif = build_publish_diagnostics_notification(uri, Some(diag));
+            return write_lsp_frame(writer, &notif);
+        }
+    }
+
+    let Some(doc) = doc_opt else {
+        return Ok(());
+    };
+
+    let max_aggregate = config
+        .max_input_bytes
+        .saturating_mul(2)
+        .min(MAX_TOTAL_DOCUMENT_BYTES)
+        .max(config.max_input_bytes);
+    let entry_cost = uri.len().saturating_add(doc.len());
+
+    if doc.len() > config.max_input_bytes
+        || documents.len() >= MAX_OPEN_DOCUMENTS
+        || total_open_bytes.saturating_add(entry_cost) > max_aggregate
+    {
+        let diag = (
+            0,
+            0,
+            0,
+            "Document exceeds maximum allowed size or open document capacity".to_string(),
+        );
+        let notif = build_publish_diagnostics_notification(uri, Some(diag));
+        return write_lsp_frame(writer, &notif);
+    }
+
+    publish_diagnostics_for_doc(writer, uri, &doc, config)?;
+    *total_open_bytes = total_open_bytes.saturating_add(entry_cost);
+    documents.insert(uri.to_string(), doc);
+    Ok(())
+}
+
+/// Applies either a full-document replacement (`range == None`) or an LSP incremental UTF-16 range
+/// edit (`range == Some(...)`) to `doc`, enforcing `max_input_bytes` before mutating (PERF-03).
+pub fn apply_incremental_change(
+    doc: &mut String,
+    range: Option<&RpcValue>,
+    new_text: &str,
+    max_input_bytes: usize,
+) -> bool {
+    match range {
+        None => {
+            if new_text.len() > max_input_bytes {
+                return false;
+            }
+            doc.clear();
+            doc.push_str(new_text);
+            true
+        }
+        Some(range_obj) => {
+            let Some(start_obj) = range_obj.get_field("start") else {
+                return false;
+            };
+            let Some(end_obj) = range_obj.get_field("end") else {
+                return false;
+            };
+            let (Some(start_line), Some(start_char), Some(end_line), Some(end_char)) = (
+                start_obj.get_field("line").and_then(|v| v.as_usize()),
+                start_obj.get_field("character").and_then(|v| v.as_usize()),
+                end_obj.get_field("line").and_then(|v| v.as_usize()),
+                end_obj.get_field("character").and_then(|v| v.as_usize()),
+            ) else {
+                return false;
+            };
+
+            let Some(start_byte) = utf16_position_to_byte_offset(doc, start_line, start_char)
+            else {
+                return false;
+            };
+            let Some(end_byte) = utf16_position_to_byte_offset(doc, end_line, end_char) else {
+                return false;
+            };
+            if start_byte > end_byte || end_byte > doc.len() {
+                return false;
+            }
+
+            let removed_len = end_byte - start_byte;
+            let new_len = doc
+                .len()
+                .saturating_sub(removed_len)
+                .saturating_add(new_text.len());
+            if new_len > max_input_bytes {
+                return false;
+            }
+
+            doc.replace_range(start_byte..end_byte, new_text);
+            true
+        }
+    }
 }
 
 fn max_frame_size(max_input_bytes: usize) -> usize {
@@ -397,6 +523,16 @@ fn apply_initialization_options(
     }
     if let Some(minify) = init_opts.get_field("minify").and_then(|v| v.as_bool()) {
         config.minify = minify;
+    }
+    if let Some(allow_comments) = init_opts
+        .get_field("allowComments")
+        .or_else(|| init_opts.get_field("allow_comments"))
+        .and_then(|v| v.as_bool())
+    {
+        config.allow_comments = allow_comments;
+    }
+    if let Some(strict) = init_opts.get_field("strict").and_then(|v| v.as_bool()) {
+        config.allow_comments = !strict;
     }
     if let Some(max_size) = init_opts
         .get_field("maxSize")
@@ -436,7 +572,7 @@ fn publish_diagnostics_for_doc<W: Write>(
     config: &LspConfig,
 ) -> io::Result<()> {
     let max_mem = compute_lsp_max_output_bytes(config.max_input_bytes);
-    let diag_opt = match lint_json_with_limit(text.as_bytes(), max_mem) {
+    let diag_opt = match lint_json_with_options(text.as_bytes(), config.allow_comments, max_mem) {
         Ok(()) => None,
         Err(err) => {
             let (line_0, char_0) = offset_to_utf16_position(text, err.offset);
@@ -497,24 +633,40 @@ fn build_publish_diagnostics_notification(
     }
 }
 
-/// Converts a byte offset in `text` into 0-indexed LSP `(line, utf16_character)` coordinates.
+/// Converts a byte offset in `text` into 0-indexed LSP `(line, utf16_character)` coordinates
+/// using 8-byte SWAR newline counting and an O(1) ASCII column fast-path (PERF-03).
 /// Safely snaps `byte_offset` down to the nearest valid UTF-8 character boundary so it can never panic (TVEK-13).
 pub fn offset_to_utf16_position(text: &str, byte_offset: usize) -> (usize, usize) {
     let clamped = byte_offset.min(text.len());
-    let bytes = text.as_bytes();
-    let mut line = 0usize;
-    let mut line_start = 0usize;
+    let prefix = &text.as_bytes()[..clamped];
 
-    for (idx, &b) in bytes[..clamped].iter().enumerate() {
-        if b == b'\n' {
-            line += 1;
-            line_start = idx + 1;
+    let mut line = 0usize;
+    let mut i = 0usize;
+    while i + 8 <= prefix.len() {
+        let chunk = u64::from_ne_bytes(prefix[i..i + 8].try_into().unwrap());
+        let x = chunk ^ 0x0A0A_0A0A_0A0A_0A0A;
+        let mask = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+        if mask != 0 {
+            line += mask.count_ones() as usize;
         }
+        i += 8;
+    }
+    while i < prefix.len() {
+        if prefix[i] == b'\n' {
+            line += 1;
+        }
+        i += 1;
     }
 
+    let line_start = prefix
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |pos| pos + 1);
+
+    let full_bytes = text.as_bytes();
     let mut col_end = if clamped > line_start
-        && bytes[clamped - 1] == b'\r'
-        && bytes.get(clamped) == Some(&b'\n')
+        && full_bytes[clamped - 1] == b'\r'
+        && full_bytes.get(clamped) == Some(&b'\n')
     {
         clamped - 1
     } else {
@@ -526,8 +678,111 @@ pub fn offset_to_utf16_position(text: &str, byte_offset: usize) -> (usize, usize
     }
 
     let line_prefix = &text[line_start..col_end];
-    let utf16_col: usize = line_prefix.chars().map(|c| c.len_utf16()).sum();
+    let utf16_col = if line_prefix.is_ascii() {
+        line_prefix.len()
+    } else {
+        line_prefix.chars().map(|c| c.len_utf16()).sum()
+    };
     (line, utf16_col)
+}
+
+/// Converts a 0-indexed LSP `(target_line, target_utf16_col)` position into a valid UTF-8 byte
+/// offset in `text` using 8-byte SWAR newline search and an ASCII column fast-path (PERF-03).
+pub fn utf16_position_to_byte_offset(
+    text: &str,
+    target_line: usize,
+    target_utf16_col: usize,
+) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let line_start = if target_line == 0 {
+        0
+    } else {
+        let mut rem_lines = target_line;
+        let mut i = 0usize;
+        let mut found_start = None;
+        while i + 8 <= bytes.len() {
+            let chunk = u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
+            let x = chunk ^ 0x0A0A_0A0A_0A0A_0A0A;
+            let mask = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+            if mask != 0 {
+                let count = mask.count_ones() as usize;
+                if count < rem_lines {
+                    rem_lines -= count;
+                    i += 8;
+                    continue;
+                }
+                for j in 0..8 {
+                    if bytes[i + j] == b'\n' {
+                        rem_lines -= 1;
+                        if rem_lines == 0 {
+                            found_start = Some(i + j + 1);
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
+            i += 8;
+        }
+        if found_start.is_none() {
+            while i < bytes.len() {
+                if bytes[i] == b'\n' {
+                    rem_lines -= 1;
+                    if rem_lines == 0 {
+                        found_start = Some(i + 1);
+                        break;
+                    }
+                }
+                i += 1;
+            }
+        }
+        found_start?
+    };
+
+    if target_utf16_col == 0 {
+        return Some(line_start);
+    }
+
+    // Find the end of `target_line` (excluding trailing `\r\n` or `\n`)
+    let rem_bytes = &bytes[line_start..];
+    let mut rel_end = 0usize;
+    while rel_end + 8 <= rem_bytes.len() {
+        let chunk = u64::from_ne_bytes(rem_bytes[rel_end..rel_end + 8].try_into().unwrap());
+        let x = chunk ^ 0x0A0A_0A0A_0A0A_0A0A;
+        let mask = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+        if mask != 0 {
+            break;
+        }
+        rel_end += 8;
+    }
+    while rel_end < rem_bytes.len() && rem_bytes[rel_end] != b'\n' {
+        rel_end += 1;
+    }
+    let line_end = if rel_end > 0 && rem_bytes[rel_end - 1] == b'\r' {
+        line_start + rel_end - 1
+    } else {
+        line_start + rel_end
+    };
+
+    let line_slice = &text[line_start..line_end];
+    if line_slice.is_ascii() {
+        return Some(line_start + target_utf16_col.min(line_slice.len()));
+    }
+
+    let mut utf16_accum = 0usize;
+    for (byte_idx, ch) in line_slice.char_indices() {
+        if utf16_accum == target_utf16_col {
+            return Some(line_start + byte_idx);
+        }
+        if utf16_accum > target_utf16_col {
+            return None; // target_utf16_col split a UTF-16 surrogate pair (TVEK-19)
+        }
+        utf16_accum += ch.len_utf16();
+    }
+    if utf16_accum > target_utf16_col {
+        return None;
+    }
+    Some(line_end)
 }
 
 /// Computes the 0-indexed LSP `(line, utf16_character)` position at the end of `text`.
@@ -656,32 +911,64 @@ fn trim_ascii_crlf(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
+/// Escapes `s` into `out` using an 8-byte SWAR scan and bulk slice copies (PERF-02).
 fn escape_json_string(s: &str, out: &mut String) {
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{0008}' => out.push_str("\\b"),
-            '\u{000C}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let code = c as u32;
-                let hex = b"0123456789abcdef";
-                out.push_str("\\u00");
-                out.push(hex[((code >> 4) & 0xF) as usize] as char);
-                out.push(hex[(code & 0xF) as usize] as char);
+    let bytes = s.as_bytes();
+    let mut last_flush = 0usize;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        while i + 8 <= bytes.len() {
+            let chunk = u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
+            if is_plain_ascii_string_chunk(chunk) {
+                i += 8;
+            } else {
+                break;
             }
-            c => out.push(c),
         }
+        if i >= bytes.len() {
+            break;
+        }
+        let b = bytes[i];
+        let escaped: Option<&str> = match b {
+            b'"' => Some("\\\""),
+            b'\\' => Some("\\\\"),
+            0x08 => Some("\\b"),
+            0x0C => Some("\\f"),
+            b'\n' => Some("\\n"),
+            b'\r' => Some("\\r"),
+            b'\t' => Some("\\t"),
+            0x00..=0x1F => None,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        if i > last_flush {
+            out.push_str(&s[last_flush..i]);
+        }
+        if let Some(esc_str) = escaped {
+            out.push_str(esc_str);
+        } else {
+            let hex = b"0123456789abcdef";
+            out.push_str("\\u00");
+            out.push(hex[((b >> 4) & 0xF) as usize] as char);
+            out.push(hex[(b & 0xF) as usize] as char);
+        }
+        i += 1;
+        last_flush = i;
+    }
+
+    if last_flush < s.len() {
+        out.push_str(&s[last_flush..]);
     }
 }
 
-// --- Zero-Dependency Iterative & Bounded JSON-RPC Value Reader (TVEK-12) ---
+// --- Zero-Dependency Single-Pass Iterative & Bounded JSON-RPC Value Reader (TVEK-12 / PERF-01 / PERF-02) ---
 
 #[derive(Debug, Clone)]
-enum RpcValue {
+pub enum RpcValue {
     Null,
     Bool(bool),
     Number(String),
@@ -751,6 +1038,7 @@ fn serialize_rpc_value(val: &RpcValue) -> String {
 enum RpcBuildFrame {
     Object {
         entries: Vec<(String, RpcValue)>,
+        seen_keys: Option<HashSet<String>>,
         pending_key: String,
     },
     Array {
@@ -759,6 +1047,9 @@ enum RpcBuildFrame {
 }
 
 fn parse_rpc_value(input: &[u8]) -> Option<RpcValue> {
+    if input.starts_with(b"\xEF\xBB\xBF") {
+        return None;
+    }
     let mut parser = RpcParser {
         input,
         pos: 0,
@@ -789,8 +1080,21 @@ impl<'a> RpcParser<'a> {
         }
     }
 
+    #[inline]
     fn skip_ws(&mut self) {
         while self.pos < self.input.len() {
+            while self.pos + 8 <= self.input.len() {
+                let chunk =
+                    u64::from_ne_bytes(self.input[self.pos..self.pos + 8].try_into().unwrap());
+                if chunk == 0x2020_2020_2020_2020 {
+                    self.pos += 8;
+                } else {
+                    break;
+                }
+            }
+            if self.pos >= self.input.len() {
+                break;
+            }
             match self.input[self.pos] {
                 b' ' | b'\t' | b'\n' | b'\r' => self.pos += 1,
                 _ => break,
@@ -798,7 +1102,8 @@ impl<'a> RpcParser<'a> {
         }
     }
 
-    /// Iterative JSON-RPC envelope parser bounded by `MAX_RPC_DEPTH` and `MAX_RPC_NODES` (TVEK-12).
+    /// Iterative strict RFC 8259 JSON-RPC envelope parser bounded by `MAX_RPC_DEPTH` and
+    /// `MAX_RPC_NODES` (TVEK-12 / PERF-01).
     fn parse_root(&mut self) -> Option<RpcValue> {
         let mut stack: Vec<RpcBuildFrame> = Vec::with_capacity(16);
 
@@ -827,6 +1132,7 @@ impl<'a> RpcParser<'a> {
                         self.pos += 1;
                         stack.push(RpcBuildFrame::Object {
                             entries: Vec::new(),
+                            seen_keys: None,
                             pending_key: key,
                         });
                     }
@@ -849,17 +1155,35 @@ impl<'a> RpcParser<'a> {
                     }
                     b't' => {
                         self.charge_node()?;
+                        if !self.input[self.pos..].starts_with(b"true") {
+                            return None;
+                        }
                         self.pos += 4;
+                        if self.pos < self.input.len() && is_ident_continue(self.input[self.pos]) {
+                            return None;
+                        }
                         break RpcValue::Bool(true);
                     }
                     b'f' => {
                         self.charge_node()?;
+                        if !self.input[self.pos..].starts_with(b"false") {
+                            return None;
+                        }
                         self.pos += 5;
+                        if self.pos < self.input.len() && is_ident_continue(self.input[self.pos]) {
+                            return None;
+                        }
                         break RpcValue::Bool(false);
                     }
                     b'n' => {
                         self.charge_node()?;
+                        if !self.input[self.pos..].starts_with(b"null") {
+                            return None;
+                        }
                         self.pos += 4;
+                        if self.pos < self.input.len() && is_ident_continue(self.input[self.pos]) {
+                            return None;
+                        }
                         break RpcValue::Null;
                     }
                     b'-' | b'0'..=b'9' => {
@@ -875,9 +1199,27 @@ impl<'a> RpcParser<'a> {
                 match frame {
                     RpcBuildFrame::Object {
                         entries,
+                        seen_keys,
                         pending_key,
                     } => {
                         let key = std::mem::take(pending_key);
+                        if let Some(set) = seen_keys {
+                            if !set.insert(key.clone()) {
+                                return None;
+                            }
+                        } else {
+                            if entries.iter().any(|(k, _)| k == &key) {
+                                return None;
+                            }
+                            if entries.len() >= 8 {
+                                let mut set = HashSet::with_capacity(16);
+                                for (existing_k, _) in entries.iter() {
+                                    set.insert(existing_k.clone());
+                                }
+                                set.insert(key.clone());
+                                *seen_keys = Some(set);
+                            }
+                        }
                         entries.push((key, current_val));
                         match *self.input.get(self.pos)? {
                             b',' => {
@@ -934,66 +1276,186 @@ impl<'a> RpcParser<'a> {
 
     fn parse_number(&mut self) -> Option<String> {
         let start = self.pos;
-        while self.pos < self.input.len() {
-            match self.input[self.pos] {
-                b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E' => self.pos += 1,
-                _ => break,
+        if self.input[self.pos] == b'-' {
+            self.pos += 1;
+            if self.pos >= self.input.len() || self.input[self.pos] == b'.' {
+                return None;
             }
+        }
+        match *self.input.get(self.pos)? {
+            b'0' => {
+                self.pos += 1;
+                if self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
+                    return None;
+                }
+            }
+            b'1'..=b'9' => {
+                self.pos += 1;
+                while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
+                    self.pos += 1;
+                }
+            }
+            _ => return None,
+        }
+        if self.pos < self.input.len() && self.input[self.pos] == b'.' {
+            self.pos += 1;
+            if self.pos >= self.input.len() || !self.input[self.pos].is_ascii_digit() {
+                return None;
+            }
+            while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
+                self.pos += 1;
+            }
+        }
+        if self.pos < self.input.len()
+            && (self.input[self.pos] == b'e' || self.input[self.pos] == b'E')
+        {
+            self.pos += 1;
+            if self.pos < self.input.len()
+                && (self.input[self.pos] == b'+' || self.input[self.pos] == b'-')
+            {
+                self.pos += 1;
+            }
+            if self.pos >= self.input.len() || !self.input[self.pos].is_ascii_digit() {
+                return None;
+            }
+            while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
+                self.pos += 1;
+            }
+        }
+        if self.pos < self.input.len()
+            && (self.input[self.pos] == b'.' || is_ident_continue(self.input[self.pos]))
+        {
+            return None;
         }
         std::str::from_utf8(&self.input[start..self.pos])
             .ok()
             .map(ToString::to_string)
     }
 
+    /// Strict RFC 8259 string parser with 8-byte SWAR scanning, zero-escape single-memcpy
+    /// fast-path, and bulk slice appending between escapes (PERF-01 / PERF-02).
     fn parse_string(&mut self) -> Option<String> {
         if *self.input.get(self.pos)? != b'"' {
             return None;
         }
         self.pos += 1;
-        let mut out = String::new();
-        while self.pos < self.input.len() {
+        let start = self.pos;
+
+        // Scan initial unescaped run
+        loop {
+            while self.pos + 8 <= self.input.len() {
+                let chunk =
+                    u64::from_ne_bytes(self.input[self.pos..self.pos + 8].try_into().unwrap());
+                if is_plain_ascii_string_chunk(chunk) {
+                    self.pos += 8;
+                } else {
+                    break;
+                }
+            }
+            if self.pos >= self.input.len() {
+                return None;
+            }
             let b = self.input[self.pos];
             if b == b'"' {
-                self.pos += 1;
-                return Some(out);
-            } else if b == b'\\' {
-                self.pos += 1;
-                let esc = *self.input.get(self.pos)?;
-                self.pos += 1;
-                match esc {
-                    b'"' => out.push('"'),
-                    b'\\' => out.push('\\'),
-                    b'/' => out.push('/'),
-                    b'b' => out.push('\u{0008}'),
-                    b'f' => out.push('\u{000C}'),
-                    b'n' => out.push('\n'),
-                    b'r' => out.push('\r'),
-                    b't' => out.push('\t'),
-                    b'u' => {
-                        let code = self.read_hex4()?;
-                        if (0xD800..=0xDBFF).contains(&code) {
-                            self.pos += 2; // skip `\u`
-                            let low = self.read_hex4()?;
-                            let combined =
-                                0x10000 + (((code as u32 - 0xD800) << 10) | (low as u32 - 0xDC00));
-                            out.push(char::from_u32(combined)?);
-                        } else {
-                            out.push(char::from_u32(code as u32)?);
-                        }
-                    }
-                    _ => return None,
-                }
-            } else {
-                let start = self.pos;
-                self.pos += 1;
-                while self.pos < self.input.len() && (self.input[self.pos] & 0xC0) == 0x80 {
-                    self.pos += 1;
-                }
                 let s = std::str::from_utf8(&self.input[start..self.pos]).ok()?;
-                out.push_str(s);
+                self.pos += 1;
+                return Some(s.to_owned());
+            }
+            if b == b'\\' {
+                break;
+            }
+            if b < 0x20 {
+                return None;
+            }
+            self.pos += 1;
+        }
+
+        // Escaped path: flush initial clean slice and decode escapes + subsequent runs in bulk
+        let first_clean = std::str::from_utf8(&self.input[start..self.pos]).ok()?;
+        let mut out = String::with_capacity(
+            first_clean
+                .len()
+                .saturating_add(64)
+                .min(MAX_FRAME_PREALLOC_BYTES),
+        );
+        out.push_str(first_clean);
+
+        loop {
+            self.pos += 1; // skip `\`
+            let esc = *self.input.get(self.pos)?;
+            self.pos += 1;
+            match esc {
+                b'"' => out.push('"'),
+                b'\\' => out.push('\\'),
+                b'/' => out.push('/'),
+                b'b' => out.push('\u{0008}'),
+                b'f' => out.push('\u{000C}'),
+                b'n' => out.push('\n'),
+                b'r' => out.push('\r'),
+                b't' => out.push('\t'),
+                b'u' => {
+                    let code = self.read_hex4()?;
+                    if (0xDC00..=0xDFFF).contains(&code) {
+                        return None;
+                    }
+                    if (0xD800..=0xDBFF).contains(&code) {
+                        if self.pos + 2 > self.input.len()
+                            || self.input[self.pos] != b'\\'
+                            || self.input[self.pos + 1] != b'u'
+                        {
+                            return None;
+                        }
+                        self.pos += 2; // skip `\u`
+                        let low = self.read_hex4()?;
+                        if !(0xDC00..=0xDFFF).contains(&low) {
+                            return None;
+                        }
+                        let combined =
+                            0x10000 + (((code as u32 - 0xD800) << 10) | (low as u32 - 0xDC00));
+                        out.push(char::from_u32(combined)?);
+                    } else {
+                        out.push(char::from_u32(code as u32)?);
+                    }
+                }
+                _ => return None,
+            }
+
+            let run_start = self.pos;
+            loop {
+                while self.pos + 8 <= self.input.len() {
+                    let chunk =
+                        u64::from_ne_bytes(self.input[self.pos..self.pos + 8].try_into().unwrap());
+                    if is_plain_ascii_string_chunk(chunk) {
+                        self.pos += 8;
+                    } else {
+                        break;
+                    }
+                }
+                if self.pos >= self.input.len() {
+                    return None;
+                }
+                let b = self.input[self.pos];
+                if b == b'"' {
+                    if self.pos > run_start {
+                        let span = std::str::from_utf8(&self.input[run_start..self.pos]).ok()?;
+                        out.push_str(span);
+                    }
+                    self.pos += 1;
+                    return Some(out);
+                }
+                if b == b'\\' {
+                    if self.pos > run_start {
+                        let span = std::str::from_utf8(&self.input[run_start..self.pos]).ok()?;
+                        out.push_str(span);
+                    }
+                    break;
+                }
+                if b < 0x20 {
+                    return None;
+                }
+                self.pos += 1;
             }
         }
-        None
     }
 
     fn read_hex4(&mut self) -> Option<u16> {
@@ -1189,6 +1651,7 @@ mod tests {
         let mut cfg = LspConfig {
             sort_keys: false,
             minify: false,
+            allow_comments: true,
             max_input_bytes: 1024,
         };
         let opts = parse_rpc_value(br#"{"maxSize": 999999999}"#).unwrap();
@@ -1220,6 +1683,7 @@ mod tests {
         let small_cfg = LspConfig {
             sort_keys: false,
             minify: false,
+            allow_comments: true,
             max_input_bytes: 32,
         };
         let mut stream = String::new();
@@ -1299,5 +1763,109 @@ mod tests {
             .and_then(|e| e.get_field("code"))
             .map(serialize_rpc_value);
         assert_eq!(err_str.as_deref(), Some("-32002"));
+    }
+
+    #[test]
+    fn test_perf_01_02_03_incremental_sync_and_single_pass_rpc() {
+        let mut stream = String::new();
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        ));
+        // 1. Open document with multi-line JSON including UTF-16 astral emoji ("😀" = 2 UTF-16 units)
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///inc.json","languageId":"json","version":1,"text":"{\n  \"😀\": 1,\n  \"b\": 2\n}\n"}}}"#,
+        ));
+        // 2. Apply incremental range edits:
+        //    - Change `1` on line 1 (after `  "😀": `, which is 2 + 1 + 2 + 3 = 8 UTF-16 units, col 8..9) to `10`
+        //    - Change `2` on line 2 (after `  "b": `, col 7..8) to `20`
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///inc.json","version":2},"contentChanges":[{"range":{"start":{"line":1,"character":8},"end":{"line":1,"character":9}},"text":"10"},{"range":{"start":{"line":2,"character":7},"end":{"line":2,"character":8}},"text":"20"}]}}"#,
+        ));
+        // 3. Request formatting with tabSize: 4 to verify the incrementally updated buffer
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///inc.json"},"options":{"tabSize":4,"insertSpaces":true}}}"#,
+        ));
+
+        let mut reader = Cursor::new(stream.into_bytes());
+        let mut writer = Vec::new();
+        let _ = run_server_loop(&mut reader, &mut writer, LspConfig::default()).unwrap();
+
+        let frames = read_all_frames(&writer);
+        assert_eq!(frames.len(), 4);
+
+        // Verify initialize advertises textDocumentSync.change == 2 (Incremental)
+        let sync_change = frames[0]
+            .get_field("result")
+            .and_then(|r| r.get_field("capabilities"))
+            .and_then(|c| c.get_field("textDocumentSync"))
+            .and_then(|s| s.get_field("change"))
+            .and_then(|v| v.as_usize());
+        assert_eq!(sync_change, Some(2));
+
+        let edits = frames[3]
+            .get_field("result")
+            .and_then(|r| r.as_array())
+            .unwrap();
+        assert_eq!(
+            edits[0].get_field("newText").and_then(|v| v.as_str()),
+            Some("{\n    \"😀\": 10,\n    \"b\": 20\n}\n")
+        );
+
+        // Verify single-pass RpcParser strictly rejects malformed JSON-RPC tokens
+        assert!(parse_rpc_value(br#"{"id": 01}"#).is_none());
+        assert!(parse_rpc_value(br#"{"id": 1, "id": 2}"#).is_none());
+        assert!(parse_rpc_value(br#"{"id": "\uD800"}"#).is_none());
+        assert!(parse_rpc_value(br#"{"id": truefalse}"#).is_none());
+        assert!(parse_rpc_value(b"\xEF\xBB\xBF{}").is_none());
+    }
+
+    #[test]
+    fn test_tvek_19_and_tvek_20_unopened_ranged_edit_mid_surrogate_and_large_rpc_object() {
+        // 1. Mid-surrogate UTF-16 column offset must return None instead of snapping (TVEK-19)
+        let emoji_line = "\"😀\": 1\n";
+        assert_eq!(utf16_position_to_byte_offset(emoji_line, 0, 0), Some(0));
+        assert_eq!(utf16_position_to_byte_offset(emoji_line, 0, 1), Some(1));
+        assert_eq!(utf16_position_to_byte_offset(emoji_line, 0, 2), None); // `"` is col 0..1, `😀` is col 1..3
+        assert_eq!(utf16_position_to_byte_offset(emoji_line, 0, 3), Some(5));
+
+        // 2. Ranged didChange on an unopened document must be rejected and NOT populate `documents` (TVEK-19)
+        let mut stream = String::new();
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        ));
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///unopened.json","version":2},"contentChanges":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"text":"{}"}]}}"#,
+        ));
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///unopened.json"},"options":{"tabSize":2,"insertSpaces":true}}}"#,
+        ));
+
+        let mut reader = Cursor::new(stream.into_bytes());
+        let mut writer = Vec::new();
+        let _ = run_server_loop(&mut reader, &mut writer, LspConfig::default()).unwrap();
+        let frames = read_all_frames(&writer);
+        assert_eq!(frames.len(), 2);
+        // Formatting unopened document must return `null` result, not a full-document replacement
+        assert_eq!(
+            frames[1]
+                .get_field("result")
+                .map(serialize_rpc_value)
+                .as_deref(),
+            Some("null")
+        );
+
+        // 3. Large RPC object (> 8 keys) duplicate detection via O(N) HashSet (TVEK-20)
+        let mut obj = String::from("{");
+        for i in 0..32 {
+            if i > 0 {
+                obj.push(',');
+            }
+            obj.push_str(&format!("\"key_{:02}\":{}", i, i));
+        }
+        let mut dup_obj = obj.clone();
+        dup_obj.push_str(",\"key_15\":99}");
+        obj.push('}');
+        assert!(parse_rpc_value(obj.as_bytes()).is_some());
+        assert!(parse_rpc_value(dup_obj.as_bytes()).is_none());
     }
 }
