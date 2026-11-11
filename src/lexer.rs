@@ -6,6 +6,7 @@ use std::mem::size_of;
 use crate::error::SyntaxError;
 
 pub const MAX_DEPTH: usize = 512;
+pub const MAX_LINT_DIAGNOSTICS: usize = 50;
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 const MAX_INITIAL_CAPACITY: usize = 16 * 1024 * 1024; // 16 MiB cap on initial Vec reservation
@@ -13,6 +14,9 @@ const SMALL_KEY_SET_LIMIT: usize = 8;
 const MAX_POOLED_HASHSET_CAPACITY: usize = 64;
 const MAX_FREE_KEY_SETS: usize = 32;
 const FX_SEED_CONST: u64 = 0x517c_c1b7_2722_0a95;
+
+static STATIC_SPACES: [u8; MAX_DEPTH * 8] = [b' '; MAX_DEPTH * 8];
+static STATIC_TABS: [u8; MAX_DEPTH] = [b'\t'; MAX_DEPTH];
 
 /// Fast, zero-dependency 64-bit multiply-rotate hasher seeded with stack/code address entropy (PERF-05).
 #[derive(Clone, Copy)]
@@ -219,37 +223,58 @@ impl<'a> KeySet<'a> {
     }
 }
 
-/// Pre-allocated single-slice indentation table for O(1) slice emission up to `MAX_DEPTH` (IMP-05).
+enum IndentBacking {
+    Static(&'static [u8]),
+    Owned(Vec<u8>),
+}
+
+/// Pre-allocated single-slice indentation table for O(1) slice emission up to `MAX_DEPTH`,
+/// backed by static `.rodata` slices for standard indentations (`<= 8` spaces and tabs) (IMP-05 / PERF-08).
 struct IndentTable {
-    buf: Vec<u8>,
+    backing: IndentBacking,
     unit_len: usize,
 }
 
 impl IndentTable {
+    #[inline]
     fn new(indent: usize, minify: bool) -> Self {
         if minify {
             return Self {
-                buf: Vec::new(),
+                backing: IndentBacking::Static(&[]),
                 unit_len: 0,
             };
         }
         if indent == 0 {
             Self {
-                buf: vec![b'\t'; MAX_DEPTH],
+                backing: IndentBacking::Static(&STATIC_TABS),
                 unit_len: 1,
+            }
+        } else if indent <= 8 {
+            Self {
+                backing: IndentBacking::Static(&STATIC_SPACES[..indent * MAX_DEPTH]),
+                unit_len: indent,
             }
         } else {
             Self {
-                buf: vec![b' '; indent.saturating_mul(MAX_DEPTH)],
+                backing: IndentBacking::Owned(vec![b' '; indent.saturating_mul(MAX_DEPTH)]),
                 unit_len: indent,
             }
         }
     }
 
     #[inline(always)]
+    fn as_slice(&self) -> &[u8] {
+        match &self.backing {
+            IndentBacking::Static(s) => s,
+            IndentBacking::Owned(v) => v.as_slice(),
+        }
+    }
+
+    #[inline(always)]
     fn slice_for_depth(&self, depth: usize) -> &[u8] {
-        let len = self.unit_len.saturating_mul(depth).min(self.buf.len());
-        &self.buf[..len]
+        let slice = self.as_slice();
+        let len = self.unit_len.saturating_mul(depth).min(slice.len());
+        &slice[..len]
     }
 }
 
@@ -290,6 +315,34 @@ pub fn lint_json_with_options(
     scanner.run_unified_parser(&mut emitter)
 }
 
+/// Validate syntax and collect up to `max_errors` local diagnostics in a single pass (PERF-10).
+/// Uses the zero-overhead fast path when the document is valid and enters cold-path recovery
+/// only when a syntax error is present.
+pub fn lint_json_multi_with_options(
+    input: &[u8],
+    allow_comments: bool,
+    max_key_bytes: usize,
+    max_errors: usize,
+) -> Vec<SyntaxError> {
+    if max_errors == 0 {
+        return Vec::new();
+    }
+    match lint_json_with_options(input, allow_comments, max_key_bytes) {
+        Ok(()) => Vec::new(),
+        Err(first_err) => {
+            if max_errors == 1 {
+                return vec![first_err];
+            }
+            let mut diags =
+                collect_multi_diagnostics(input, allow_comments, max_key_bytes, max_errors);
+            if diags.is_empty() {
+                diags.push(first_err);
+            }
+            diags
+        }
+    }
+}
+
 /// Validate syntax and format JSON/JSONC according to `options` with the default output size cap.
 pub fn format_json(input: &[u8], options: &FormatOptions) -> Result<Vec<u8>, SyntaxError> {
     format_json_with_limit(input, options, DEFAULT_MAX_OUTPUT_BYTES)
@@ -302,6 +355,20 @@ pub fn format_json_with_limit(
     options: &FormatOptions,
     max_output_bytes: usize,
 ) -> Result<Vec<u8>, SyntaxError> {
+    let mut out = Vec::new();
+    format_json_into_buf(input, options, max_output_bytes, &mut out)?;
+    Ok(out)
+}
+
+/// Validate syntax and format JSON/JSONC directly into a caller-provided reusable `Vec<u8>`
+/// with an explicit upper bound on output and DOM memory (PERF-08 / TVEK-02).
+pub fn format_json_into_buf(
+    input: &[u8],
+    options: &FormatOptions,
+    max_output_bytes: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), SyntaxError> {
+    out.clear();
     let initial_cap = if options.minify {
         input.len().saturating_add(1)
     } else {
@@ -313,8 +380,12 @@ pub fn format_json_with_limit(
     .min(max_output_bytes)
     .min(MAX_INITIAL_CAPACITY);
 
+    if out.capacity() < initial_cap {
+        out.reserve(initial_cap - out.capacity());
+    }
+
     let indent_table = IndentTable::new(options.indent, options.minify);
-    let mut sink = BoundedVecSink::new(initial_cap, max_output_bytes);
+    let mut sink = BoundedVecRefSink::new(out, max_output_bytes);
     let mut scanner = Scanner::new(input, options.allow_comments, max_output_bytes);
 
     if options.sort_keys {
@@ -353,7 +424,7 @@ pub fn format_json_with_limit(
         scanner.run_unified_parser(&mut emitter)?;
     }
 
-    Ok(sink.into_inner())
+    Ok(())
 }
 
 trait OutputSink {
@@ -379,23 +450,15 @@ impl OutputSink for NullSink {
     }
 }
 
-struct BoundedVecSink {
-    buf: Vec<u8>,
+struct BoundedVecRefSink<'b> {
+    buf: &'b mut Vec<u8>,
     max_bytes: usize,
 }
 
-impl BoundedVecSink {
+impl<'b> BoundedVecRefSink<'b> {
     #[inline]
-    fn new(capacity: usize, max_bytes: usize) -> Self {
-        Self {
-            buf: Vec::with_capacity(capacity),
-            max_bytes,
-        }
-    }
-
-    #[inline]
-    fn into_inner(self) -> Vec<u8> {
-        self.buf
+    fn new(buf: &'b mut Vec<u8>, max_bytes: usize) -> Self {
+        Self { buf, max_bytes }
     }
 
     #[inline]
@@ -408,7 +471,7 @@ impl BoundedVecSink {
     }
 }
 
-impl OutputSink for BoundedVecSink {
+impl<'b> OutputSink for BoundedVecRefSink<'b> {
     #[inline(always)]
     fn push_byte(&mut self, b: u8) -> Result<(), &'static str> {
         self.check_additional(1)?;
@@ -1403,6 +1466,7 @@ struct Scanner<'a> {
     allow_comments: bool,
     max_scratch_bytes: usize,
     last_string_has_escapes: bool,
+    defer_line_col: bool,
 }
 
 impl<'a> Scanner<'a> {
@@ -1414,12 +1478,22 @@ impl<'a> Scanner<'a> {
             allow_comments,
             max_scratch_bytes,
             last_string_has_escapes: false,
+            defer_line_col: false,
         }
     }
 
     #[inline]
     fn err(&self, message: &'static str, offset: usize) -> SyntaxError {
-        SyntaxError::new(message, offset, self.input)
+        if self.defer_line_col {
+            SyntaxError {
+                message: message.into(),
+                offset: offset.min(self.input.len()),
+                line: 0,
+                col: 0,
+            }
+        } else {
+            SyntaxError::new(message, offset, self.input)
+        }
     }
 
     /// Scans RFC 8259 insignificant whitespace (`0x20`, `0x09`, `0x0A`, `0x0D`) with an 8-byte
@@ -1434,16 +1508,8 @@ impl<'a> Scanner<'a> {
         let mut saw_newline = !has_prev_token;
 
         while self.pos < self.input.len() {
-            // 8-byte SWAR fast-path for contiguous runs of space characters (0x20)
-            while self.pos + 8 <= self.input.len() {
-                let chunk =
-                    u64::from_ne_bytes(self.input[self.pos..self.pos + 8].try_into().unwrap());
-                if chunk == 0x2020_2020_2020_2020 {
-                    self.pos += 8;
-                } else {
-                    break;
-                }
-            }
+            // Hardware SIMD (AVX2 / NEON) + 8-byte SWAR fast-path for contiguous space runs (PERF-04 / PERF-09)
+            self.pos += skip_ascii_spaces(&self.input[self.pos..]);
 
             if self.pos >= self.input.len() {
                 break;
@@ -2101,17 +2167,9 @@ impl<'a> Scanner<'a> {
         let mut has_escapes = false;
 
         while self.pos < self.input.len() {
-            // SWAR (u64) fast-path: skip 8 bytes at a time when all 8 bytes are plain ASCII
-            // in 0x20..=0x7F and neither `"` (0x22) nor `\` (0x5C) (IMP-05).
-            while self.pos + 8 <= self.input.len() {
-                let chunk =
-                    u64::from_ne_bytes(self.input[self.pos..self.pos + 8].try_into().unwrap());
-                if is_plain_ascii_string_chunk(chunk) {
-                    self.pos += 8;
-                } else {
-                    break;
-                }
-            }
+            // Hardware SIMD (AVX2 / NEON) + 8-byte SWAR fast-path: skip plain ASCII bytes in 0x20..=0x7F
+            // that are neither `"` (0x22) nor `\` (0x5C) (IMP-05 / PERF-04 / PERF-09).
+            self.pos += skip_plain_ascii_string_bytes(&self.input[self.pos..]);
 
             if self.pos >= self.input.len() {
                 break;
@@ -2210,6 +2268,216 @@ impl<'a> Scanner<'a> {
         self.pos += 4;
         Ok(val)
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn has_avx2() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static AVX2_STATE: AtomicU8 = AtomicU8::new(0);
+    match AVX2_STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let detected = std::is_x86_feature_detected!("avx2");
+            AVX2_STATE.store(if detected { 1 } else { 2 }, Ordering::Relaxed);
+            detected
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn skip_plain_ascii_string_bytes_avx2(bytes: &[u8]) -> usize {
+    use std::arch::x86_64::*;
+    let mut i = 0usize;
+    let v_quote = _mm256_set1_epi8(b'"' as i8);
+    let v_bslash = _mm256_set1_epi8(b'\\' as i8);
+    let v_space = _mm256_set1_epi8(0x20);
+
+    while i + 32 <= bytes.len() {
+        // SAFETY: `i + 32 <= bytes.len()` is checked by the loop condition, and
+        // `_mm256_loadu_si256` supports unaligned loads at any byte alignment.
+        let chunk = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(i) as *const __m256i) };
+        let eq_quote = _mm256_cmpeq_epi8(chunk, v_quote);
+        let eq_bslash = _mm256_cmpeq_epi8(chunk, v_bslash);
+        // Signed comparison `0x20 > chunk_i8` is true iff byte is in `0x00..=0x1F` (0..=31)
+        // or `0x80..=0xFF` (-128..=-1), simultaneously stopping on control chars and UTF-8 bytes!
+        let bad_range = _mm256_cmpgt_epi8(v_space, chunk);
+        let special = _mm256_or_si256(_mm256_or_si256(eq_quote, eq_bslash), bad_range);
+        let mask = _mm256_movemask_epi8(special) as u32;
+        if mask != 0 {
+            return i + (mask.trailing_zeros() as usize);
+        }
+        i += 32;
+    }
+
+    while i + 8 <= bytes.len() {
+        let chunk = u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
+        if is_plain_ascii_string_chunk(chunk) {
+            i += 8;
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn skip_plain_ascii_string_bytes_neon(bytes: &[u8]) -> usize {
+    use std::arch::aarch64::*;
+    let mut i = 0usize;
+    let v_quote = unsafe { vdupq_n_u8(b'"') };
+    let v_bslash = unsafe { vdupq_n_u8(b'\\') };
+    let v_space = unsafe { vdupq_n_s8(0x20) };
+
+    while i + 16 <= bytes.len() {
+        let chunk = unsafe { vld1q_u8(bytes.as_ptr().add(i)) };
+        let eq_quote = unsafe { vceqq_u8(chunk, v_quote) };
+        let eq_bslash = unsafe { vceqq_u8(chunk, v_bslash) };
+        let bad_range = unsafe { vcltq_s8(vreinterpretq_s8_u8(chunk), v_space) };
+        let special = unsafe { vorrq_u8(vorrq_u8(eq_quote, eq_bslash), bad_range) };
+        if unsafe { vmaxvq_u8(special) } != 0 {
+            break;
+        }
+        i += 16;
+    }
+
+    while i + 8 <= bytes.len() {
+        let chunk = u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
+        if is_plain_ascii_string_chunk(chunk) {
+            i += 8;
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+/// Skips contiguous plain ASCII string bytes (`0x20..=0x7F` excluding `"` and `\`) using
+/// 32-byte AVX2 on `x86_64`, 16-byte NEON on `aarch64`, and an 8-byte SWAR tail (PERF-09).
+#[inline(always)]
+pub(crate) fn skip_plain_ascii_string_bytes(bytes: &[u8]) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if bytes.len() >= 32 && has_avx2() {
+            // SAFETY: `has_avx2()` verified AVX2 support on the current CPU.
+            return unsafe { skip_plain_ascii_string_bytes_avx2(bytes) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if bytes.len() >= 16 {
+            // SAFETY: NEON is baseline mandatory on AArch64.
+            return unsafe { skip_plain_ascii_string_bytes_neon(bytes) };
+        }
+    }
+    let mut i = 0usize;
+    while i + 8 <= bytes.len() {
+        let chunk = u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
+        if is_plain_ascii_string_chunk(chunk) {
+            i += 8;
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn skip_ascii_spaces_avx2(bytes: &[u8]) -> usize {
+    use std::arch::x86_64::*;
+    let mut i = 0usize;
+    let v_space = _mm256_set1_epi8(b' ' as i8);
+
+    while i + 32 <= bytes.len() {
+        // SAFETY: `i + 32 <= bytes.len()` is checked by the loop condition.
+        let chunk = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(i) as *const __m256i) };
+        let eq_space = _mm256_cmpeq_epi8(chunk, v_space);
+        let non_space_mask = (_mm256_movemask_epi8(eq_space) as u32) ^ 0xFFFF_FFFF;
+        if non_space_mask != 0 {
+            return i + (non_space_mask.trailing_zeros() as usize);
+        }
+        i += 32;
+    }
+
+    while i + 8 <= bytes.len() {
+        let chunk = u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
+        if chunk == 0x2020_2020_2020_2020 {
+            i += 8;
+        } else {
+            break;
+        }
+    }
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    i
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn skip_ascii_spaces_neon(bytes: &[u8]) -> usize {
+    use std::arch::aarch64::*;
+    let mut i = 0usize;
+    let v_space = unsafe { vdupq_n_u8(b' ') };
+
+    while i + 16 <= bytes.len() {
+        let chunk = unsafe { vld1q_u8(bytes.as_ptr().add(i)) };
+        let eq_space = unsafe { vceqq_u8(chunk, v_space) };
+        if unsafe { vminvq_u8(eq_space) } != 0xFF {
+            break;
+        }
+        i += 16;
+    }
+
+    while i + 8 <= bytes.len() {
+        let chunk = u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
+        if chunk == 0x2020_2020_2020_2020 {
+            i += 8;
+        } else {
+            break;
+        }
+    }
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    i
+}
+
+/// Skips contiguous ASCII space (`0x20`) runs using 32-byte AVX2 on `x86_64`,
+/// 16-byte NEON on `aarch64`, and an 8-byte SWAR tail (PERF-09).
+#[inline(always)]
+pub(crate) fn skip_ascii_spaces(bytes: &[u8]) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if bytes.len() >= 32 && has_avx2() {
+            // SAFETY: `has_avx2()` verified AVX2 support on the current CPU.
+            return unsafe { skip_ascii_spaces_avx2(bytes) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if bytes.len() >= 16 {
+            // SAFETY: NEON is baseline mandatory on AArch64.
+            return unsafe { skip_ascii_spaces_neon(bytes) };
+        }
+    }
+    let mut i = 0usize;
+    while i + 8 <= bytes.len() {
+        let chunk = u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
+        if chunk == 0x2020_2020_2020_2020 {
+            i += 8;
+        } else {
+            break;
+        }
+    }
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    i
 }
 
 /// Returns true if all 8 bytes in `chunk` are in `0x20..=0x7F` and none equal `"` (`0x22`) or `\` (`0x5C`).
@@ -2689,6 +2957,647 @@ fn validate_utf8_char(bytes: &[u8]) -> Option<usize> {
         return None;
     }
     None
+}
+
+/// Cold-path scoped multi-diagnostic collector (PERF-10 / TVEK-21).
+/// Recovers on local, structure-preserving errors (comments in `--strict` mode, duplicate object keys,
+/// trailing commas in objects/arrays, recoverable string interior errors, and invalid scalar literals)
+/// while deferring `(line, col)` resolution to a single $O(N)$ pass via `SyntaxError::resolve_in_place`.
+#[cold]
+fn collect_multi_diagnostics(
+    input: &[u8],
+    allow_comments: bool,
+    max_key_bytes: usize,
+    max_errors: usize,
+) -> Vec<SyntaxError> {
+    let mut diags: Vec<SyntaxError> = Vec::new();
+    let mut scanner = Scanner::new(input, allow_comments, max_key_bytes);
+    scanner.defer_line_col = true;
+    collect_multi_diagnostics_inner(&mut scanner, &mut diags, max_key_bytes, max_errors);
+    SyntaxError::resolve_in_place(&mut diags, input);
+    diags
+}
+
+#[cold]
+fn collect_multi_diagnostics_inner(
+    scanner: &mut Scanner<'_>,
+    diags: &mut Vec<SyntaxError>,
+    max_key_bytes: usize,
+    max_errors: usize,
+) {
+    let input = scanner.input;
+    if input.starts_with(b"\xEF\xBB\xBF") {
+        diags.push(scanner.err(
+            "UTF-8 BOM (byte order mark) is not allowed in RFC 8259 JSON",
+            0,
+        ));
+        return;
+    }
+
+    let mut stack: Vec<StreamFrame<'_>> = Vec::with_capacity(32);
+    let mut free_sets: Vec<KeySet<'_>> = Vec::with_capacity(MAX_FREE_KEY_SETS);
+    let mut allocated_key_bytes = 0usize;
+
+    if scanner.scan_trivia_recovering(diags, max_errors).is_err() {
+        return;
+    }
+    if scanner.pos >= input.len() {
+        if diags.len() < max_errors {
+            diags.push(scanner.err("Unexpected end of JSON input", scanner.pos));
+        }
+        return;
+    }
+
+    'expect_value: loop {
+        if scanner.pos >= input.len() {
+            if diags.len() < max_errors {
+                diags.push(scanner.err("Expected JSON value, found end of input", scanner.pos));
+            }
+            return;
+        }
+
+        loop {
+            let b = input[scanner.pos];
+            if b == b'{' {
+                let open_pos = scanner.pos;
+                if stack.len() + 1 > MAX_DEPTH {
+                    if diags.len() < max_errors {
+                        diags.push(scanner.err("Maximum nesting depth of 512 exceeded", open_pos));
+                    }
+                    return;
+                }
+                scanner.pos += 1;
+                if scanner.scan_trivia_recovering(diags, max_errors).is_err() {
+                    return;
+                }
+                if scanner.pos >= input.len() {
+                    if diags.len() < max_errors {
+                        diags.push(scanner.err("Unterminated JSON object", open_pos));
+                    }
+                    return;
+                }
+                if input[scanner.pos] == b'}' {
+                    scanner.pos += 1;
+                    break;
+                }
+
+                let Ok(first_key) = scanner.scan_key_and_colon_recovering(diags, max_errors) else {
+                    return;
+                };
+                let mut key_set = free_sets.pop().unwrap_or_else(KeySet::new);
+                let (_, added) = key_set.insert(decode_key_token_safe(first_key));
+                allocated_key_bytes = allocated_key_bytes.saturating_add(added);
+                if allocated_key_bytes > max_key_bytes {
+                    if diags.len() < max_errors {
+                        diags.push(scanner.err(
+                            "Formatted output exceeds maximum allowed buffer size",
+                            first_key.key_pos,
+                        ));
+                    }
+                    return;
+                }
+                stack.push(StreamFrame::Object(key_set));
+                if scanner.pos >= input.len() {
+                    if diags.len() < max_errors {
+                        diags.push(scanner.err("Expected JSON value after ':'", scanner.pos));
+                    }
+                    return;
+                }
+            } else if b == b'[' {
+                let open_pos = scanner.pos;
+                if stack.len() + 1 > MAX_DEPTH {
+                    if diags.len() < max_errors {
+                        diags.push(scanner.err("Maximum nesting depth of 512 exceeded", open_pos));
+                    }
+                    return;
+                }
+                scanner.pos += 1;
+                if scanner.scan_trivia_recovering(diags, max_errors).is_err() {
+                    return;
+                }
+                if scanner.pos >= input.len() {
+                    if diags.len() < max_errors {
+                        diags.push(scanner.err("Unterminated JSON array", open_pos));
+                    }
+                    return;
+                }
+                if input[scanner.pos] == b']' {
+                    scanner.pos += 1;
+                    break;
+                }
+                stack.push(StreamFrame::Array);
+            } else {
+                if scanner
+                    .scan_primitive_recovering(diags, max_errors)
+                    .is_err()
+                {
+                    return;
+                }
+                break;
+            }
+        }
+
+        while let Some(top) = stack.last() {
+            let is_object = matches!(top, StreamFrame::Object(_));
+            if scanner.scan_trivia_recovering(diags, max_errors).is_err() {
+                return;
+            }
+            if is_object {
+                if scanner.pos >= input.len() {
+                    if diags.len() < max_errors {
+                        diags.push(scanner.err("Unterminated JSON object", scanner.pos));
+                    }
+                    return;
+                }
+                match input[scanner.pos] {
+                    b',' => {
+                        let comma_pos = scanner.pos;
+                        scanner.pos += 1;
+                        if scanner.scan_trivia_recovering(diags, max_errors).is_err() {
+                            return;
+                        }
+                        if scanner.pos >= input.len() {
+                            if diags.len() < max_errors {
+                                diags.push(scanner.err("Unterminated JSON object", scanner.pos));
+                            }
+                            return;
+                        }
+                        if input[scanner.pos] == b'}' {
+                            diags.push(
+                                scanner
+                                    .err("Trailing comma is not allowed in JSON object", comma_pos),
+                            );
+                            if diags.len() >= max_errors {
+                                return;
+                            }
+                            scanner.pos += 1;
+                            if let Some(StreamFrame::Object(mut key_set)) = stack.pop() {
+                                let freed = key_set.clear();
+                                allocated_key_bytes = allocated_key_bytes.saturating_sub(freed);
+                                if free_sets.len() < MAX_FREE_KEY_SETS {
+                                    free_sets.push(key_set);
+                                }
+                            }
+                            continue;
+                        }
+
+                        let Ok(next_key) = scanner.scan_key_and_colon_recovering(diags, max_errors)
+                        else {
+                            return;
+                        };
+                        if let Some(StreamFrame::Object(key_set)) = stack.last_mut() {
+                            let (inserted, added) = key_set.insert(decode_key_token_safe(next_key));
+                            if !inserted {
+                                diags.push(scanner.err(
+                                    "Duplicate object key is not allowed in JSON object",
+                                    next_key.key_pos,
+                                ));
+                                if diags.len() >= max_errors {
+                                    return;
+                                }
+                            }
+                            allocated_key_bytes = allocated_key_bytes.saturating_add(added);
+                            if allocated_key_bytes > max_key_bytes {
+                                if diags.len() < max_errors {
+                                    diags.push(scanner.err(
+                                        "Formatted output exceeds maximum allowed buffer size",
+                                        next_key.key_pos,
+                                    ));
+                                }
+                                return;
+                            }
+                        }
+                        if scanner.pos >= input.len() {
+                            if diags.len() < max_errors {
+                                diags.push(
+                                    scanner.err("Expected JSON value after ':'", scanner.pos),
+                                );
+                            }
+                            return;
+                        }
+                        continue 'expect_value;
+                    }
+                    b'}' => {
+                        scanner.pos += 1;
+                        if let Some(StreamFrame::Object(mut key_set)) = stack.pop() {
+                            let freed = key_set.clear();
+                            allocated_key_bytes = allocated_key_bytes.saturating_sub(freed);
+                            if free_sets.len() < MAX_FREE_KEY_SETS {
+                                free_sets.push(key_set);
+                            }
+                        }
+                    }
+                    _ => {
+                        if diags.len() < max_errors {
+                            diags.push(
+                                scanner.err("Expected ',' or '}' in JSON object", scanner.pos),
+                            );
+                        }
+                        return;
+                    }
+                }
+            } else {
+                if scanner.pos >= input.len() {
+                    if diags.len() < max_errors {
+                        diags.push(scanner.err("Unterminated JSON array", scanner.pos));
+                    }
+                    return;
+                }
+                match input[scanner.pos] {
+                    b',' => {
+                        let comma_pos = scanner.pos;
+                        scanner.pos += 1;
+                        if scanner.scan_trivia_recovering(diags, max_errors).is_err() {
+                            return;
+                        }
+                        if scanner.pos >= input.len() {
+                            if diags.len() < max_errors {
+                                diags.push(scanner.err("Unterminated JSON array", scanner.pos));
+                            }
+                            return;
+                        }
+                        if input[scanner.pos] == b']' {
+                            diags.push(
+                                scanner
+                                    .err("Trailing comma is not allowed in JSON array", comma_pos),
+                            );
+                            if diags.len() >= max_errors {
+                                return;
+                            }
+                            scanner.pos += 1;
+                            stack.pop();
+                            continue;
+                        }
+                        continue 'expect_value;
+                    }
+                    b']' => {
+                        scanner.pos += 1;
+                        stack.pop();
+                    }
+                    _ => {
+                        if diags.len() < max_errors {
+                            diags.push(
+                                scanner.err("Expected ',' or ']' in JSON array", scanner.pos),
+                            );
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        break 'expect_value;
+    }
+
+    if scanner.scan_trivia_recovering(diags, max_errors).is_err() {
+        return;
+    }
+    if scanner.pos < input.len() && diags.len() < max_errors {
+        diags.push(scanner.err("Trailing data after root JSON value", scanner.pos));
+    }
+}
+
+#[inline]
+fn decode_key_token_safe(key: KeyToken<'_>) -> Cow<'_, str> {
+    if !key.has_escapes {
+        let inner = &key.slice[1..key.slice.len() - 1];
+        if let Ok(s) = std::str::from_utf8(inner) {
+            return Cow::Borrowed(s);
+        }
+        return Cow::Owned(String::from_utf8_lossy(inner).into_owned());
+    }
+    decode_json_key_token(key)
+}
+
+impl<'a> Scanner<'a> {
+    fn scan_trivia_recovering(
+        &mut self,
+        diags: &mut Vec<SyntaxError>,
+        max_errors: usize,
+    ) -> Result<(), ()> {
+        while self.pos < self.input.len() {
+            self.pos += skip_ascii_spaces(&self.input[self.pos..]);
+            if self.pos >= self.input.len() {
+                break;
+            }
+            match self.input[self.pos] {
+                b' ' | b'\t' | b'\r' | b'\n' => {
+                    self.pos += 1;
+                }
+                b'/' => {
+                    let comment_pos = self.pos;
+                    let next = self.input.get(self.pos + 1).copied();
+                    match next {
+                        Some(b'/') => {
+                            if !self.allow_comments {
+                                diags.push(self.err(
+                                    "Comments are not allowed in strict RFC 8259 mode",
+                                    comment_pos,
+                                ));
+                                if diags.len() >= max_errors {
+                                    return Err(());
+                                }
+                            }
+                            if let Err(e) = self.scan_line_comment() {
+                                diags.push(e);
+                                if diags.len() >= max_errors {
+                                    return Err(());
+                                }
+                                while self.pos < self.input.len() && self.input[self.pos] != b'\n' {
+                                    self.pos += 1;
+                                }
+                            }
+                        }
+                        Some(b'*') => {
+                            if !self.allow_comments {
+                                diags.push(self.err(
+                                    "Comments are not allowed in strict RFC 8259 mode",
+                                    comment_pos,
+                                ));
+                                if diags.len() >= max_errors {
+                                    return Err(());
+                                }
+                            }
+                            if let Err(e) = self.scan_block_comment() {
+                                diags.push(e);
+                                return Err(());
+                            }
+                        }
+                        _ => {
+                            if diags.len() < max_errors {
+                                diags.push(self.err(
+                                    "Unexpected '/' in JSON input, expected '//' or '/*'",
+                                    comment_pos,
+                                ));
+                            }
+                            return Err(());
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+
+    fn scan_key_and_colon_recovering(
+        &mut self,
+        diags: &mut Vec<SyntaxError>,
+        max_errors: usize,
+    ) -> Result<KeyToken<'a>, ()> {
+        let key_pos = self.pos;
+        if self.pos >= self.input.len() {
+            if diags.len() < max_errors {
+                diags.push(self.err("Expected object key, found end of input", self.pos));
+            }
+            return Err(());
+        }
+        let slice = match self.input[self.pos] {
+            b'"' => self.scan_string_recovering(diags, max_errors)?,
+            b'\'' => {
+                if diags.len() < max_errors {
+                    diags.push(self.err("Single-quoted strings are not allowed in JSON", self.pos));
+                }
+                return Err(());
+            }
+            b',' => {
+                if diags.len() < max_errors {
+                    diags.push(self.err("Unexpected comma in JSON object", self.pos));
+                }
+                return Err(());
+            }
+            _ => {
+                if diags.len() < max_errors {
+                    diags.push(self.err("Object keys must be double-quoted strings", self.pos));
+                }
+                return Err(());
+            }
+        };
+        let has_escapes = self.last_string_has_escapes;
+        self.scan_trivia_recovering(diags, max_errors)?;
+        if self.pos >= self.input.len() || self.input[self.pos] != b':' {
+            if diags.len() < max_errors {
+                diags.push(self.err("Expected ':' after object key", self.pos));
+            }
+            return Err(());
+        }
+        let colon_pos = self.pos;
+        self.pos += 1;
+        self.scan_trivia_recovering(diags, max_errors)?;
+        Ok(KeyToken {
+            slice,
+            key_pos,
+            colon_pos,
+            has_escapes,
+        })
+    }
+
+    fn scan_string_recovering(
+        &mut self,
+        diags: &mut Vec<SyntaxError>,
+        max_errors: usize,
+    ) -> Result<&'a [u8], ()> {
+        let start = self.pos;
+        self.pos += 1; // Skip opening `"`
+        let mut has_escapes = false;
+        let mut had_interior_error = false;
+
+        while self.pos < self.input.len() {
+            self.pos += skip_plain_ascii_string_bytes(&self.input[self.pos..]);
+            if self.pos >= self.input.len() {
+                break;
+            }
+            let b = self.input[self.pos];
+            if b == b'"' {
+                self.pos += 1;
+                self.last_string_has_escapes = has_escapes && !had_interior_error;
+                return Ok(&self.input[start..self.pos]);
+            } else if b == b'\n' || b == b'\r' {
+                if diags.len() < max_errors {
+                    diags.push(self.err(
+                        "Unescaped control character is not allowed in JSON string",
+                        self.pos,
+                    ));
+                }
+                return Err(());
+            } else if b < 0x20 {
+                had_interior_error = true;
+                diags.push(self.err(
+                    "Unescaped control character is not allowed in JSON string",
+                    self.pos,
+                ));
+                if diags.len() >= max_errors {
+                    return Err(());
+                }
+                self.pos += 1;
+            } else if b == b'\\' {
+                has_escapes = true;
+                let esc_pos = self.pos;
+                self.pos += 1;
+                if self.pos >= self.input.len() {
+                    if diags.len() < max_errors {
+                        diags.push(self.err("Unterminated escape sequence in string", esc_pos));
+                    }
+                    return Err(());
+                }
+                match self.input[self.pos] {
+                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                        self.pos += 1;
+                    }
+                    b'u' => {
+                        self.pos += 1;
+                        match self.parse_hex4(esc_pos) {
+                            Ok(code) => {
+                                if (0xDC00..=0xDFFF).contains(&code) {
+                                    had_interior_error = true;
+                                    diags.push(self.err(
+                                        "Lone UTF-16 low surrogate is not allowed in JSON string",
+                                        esc_pos,
+                                    ));
+                                    if diags.len() >= max_errors {
+                                        return Err(());
+                                    }
+                                } else if (0xD800..=0xDBFF).contains(&code) {
+                                    if self.pos + 6 > self.input.len()
+                                        || self.input[self.pos] != b'\\'
+                                        || self.input[self.pos + 1] != b'u'
+                                    {
+                                        had_interior_error = true;
+                                        diags.push(self.err(
+                                            "Unpaired UTF-16 high surrogate is not allowed in JSON string",
+                                            esc_pos,
+                                        ));
+                                        if diags.len() >= max_errors {
+                                            return Err(());
+                                        }
+                                    } else {
+                                        let low_esc_pos = self.pos;
+                                        self.pos += 2;
+                                        match self.parse_hex4(low_esc_pos) {
+                                            Ok(low) => {
+                                                if !(0xDC00..=0xDFFF).contains(&low) {
+                                                    had_interior_error = true;
+                                                    diags.push(self.err(
+                                                        "Invalid UTF-16 surrogate pair: expected low surrogate (0xDC00..=0xDFFF)",
+                                                        low_esc_pos,
+                                                    ));
+                                                    if diags.len() >= max_errors {
+                                                        return Err(());
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                had_interior_error = true;
+                                                diags.push(e);
+                                                if diags.len() >= max_errors {
+                                                    return Err(());
+                                                }
+                                                self.skip_bad_hex4();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                had_interior_error = true;
+                                diags.push(e);
+                                if diags.len() >= max_errors {
+                                    return Err(());
+                                }
+                                self.skip_bad_hex4();
+                            }
+                        }
+                    }
+                    _ => {
+                        had_interior_error = true;
+                        diags.push(self.err("Invalid escape sequence in JSON string", esc_pos));
+                        if diags.len() >= max_errors {
+                            return Err(());
+                        }
+                        self.pos += 1;
+                    }
+                }
+            } else if b < 0x80 {
+                self.pos += 1;
+            } else if let Some(char_len) = validate_utf8_char(&self.input[self.pos..]) {
+                self.pos += char_len;
+            } else {
+                had_interior_error = true;
+                diags.push(self.err("Invalid UTF-8 byte sequence in string", self.pos));
+                if diags.len() >= max_errors {
+                    return Err(());
+                }
+                self.pos += 1;
+                while self.pos < self.input.len() && (self.input[self.pos] & 0xC0) == 0x80 {
+                    self.pos += 1;
+                }
+            }
+        }
+
+        if diags.len() < max_errors {
+            diags.push(self.err("Unterminated string literal", start));
+        }
+        Err(())
+    }
+
+    fn skip_bad_hex4(&mut self) {
+        let mut skipped = 0usize;
+        while skipped < 4 && self.pos < self.input.len() {
+            let b = self.input[self.pos];
+            if b == b'"' || b == b'\\' || b == b'\n' || b == b'\r' {
+                break;
+            }
+            self.pos += 1;
+            skipped += 1;
+        }
+    }
+
+    fn scan_primitive_recovering(
+        &mut self,
+        diags: &mut Vec<SyntaxError>,
+        max_errors: usize,
+    ) -> Result<(), ()> {
+        let prim_pos = self.pos;
+        let b = self.input[prim_pos];
+        if b == b'"' {
+            self.scan_string_recovering(diags, max_errors)?;
+            return Ok(());
+        }
+        match self.scan_primitive() {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                diags.push(err);
+                if diags.len() >= max_errors {
+                    return Err(());
+                }
+                // Recover on scalar/literal/number errors by advancing to the next delimiter
+                if b == b'-' || b == b'+' || b == b'.' || b.is_ascii_alphanumeric() {
+                    while self.pos < self.input.len()
+                        && !matches!(
+                            self.input[self.pos],
+                            b' ' | b'\t'
+                                | b'\n'
+                                | b'\r'
+                                | b','
+                                | b'}'
+                                | b']'
+                                | b':'
+                                | b'{'
+                                | b'['
+                                | b'"'
+                                | b'/'
+                        )
+                    {
+                        self.pos += 1;
+                    }
+                    if self.pos > prim_pos {
+                        return Ok(());
+                    }
+                }
+                Err(())
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3315,5 +4224,40 @@ mod tests {
         // Clearing a Large KeySet downgrades back to Small to free memory immediately
         set.clear();
         assert!(matches!(set.storage, KeySetStorage::Small(_)));
+    }
+
+    #[test]
+    fn test_simd_string_and_whitespace_utf8_bidi_safety() {
+        // Test strings > 64 bytes (exercising 32-byte AVX2, 16-byte NEON, and 8-byte SWAR tail)
+        // at every byte alignment offset 0..32 to prove PERF-09 stops on control chars, quotes,
+        // backslashes, UTF-8 multi-byte chars, and invalid 0xFF bytes.
+        for offset in 0..32 {
+            let prefix = "a".repeat(offset);
+            let suffix = "b".repeat(72);
+
+            // 1. Valid multi-byte UTF-8 emoji and Trojan Source BiDi char (\u{202E}) inside >64B string
+            let valid_utf8 = format!("{{\"k\":\"{}\u{202E}😀{}\"}}", prefix, suffix);
+            assert!(lint_json(valid_utf8.as_bytes()).is_ok());
+
+            // 2. Unescaped control byte (0x1F) at every offset must be rejected
+            let mut bad_ctrl = Vec::from(b"{\"k\":\"".as_slice());
+            bad_ctrl.extend_from_slice(prefix.as_bytes());
+            bad_ctrl.push(0x1F);
+            bad_ctrl.extend_from_slice(suffix.as_bytes());
+            bad_ctrl.extend_from_slice(b"\"}");
+            assert!(lint_json(&bad_ctrl).is_err());
+
+            // 3. Invalid UTF-8 byte (0xFF) at every offset must never be skipped by SIMD
+            let mut bad_utf8 = Vec::from(b"{\"k\":\"".as_slice());
+            bad_utf8.extend_from_slice(prefix.as_bytes());
+            bad_utf8.push(0xFF);
+            bad_utf8.extend_from_slice(suffix.as_bytes());
+            bad_utf8.extend_from_slice(b"\"}");
+            assert!(lint_json(&bad_utf8).is_err());
+
+            // 4. Verify skip_ascii_spaces stops accurately at every offset 0..64
+            let spaces_and_brace = format!("{}{{}}", " ".repeat(offset + 40));
+            assert_eq!(skip_ascii_spaces(spaces_and_brace.as_bytes()), offset + 40);
+        }
     }
 }

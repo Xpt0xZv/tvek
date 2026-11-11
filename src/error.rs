@@ -48,41 +48,35 @@ pub fn sanitize_for_terminal(input: &str, allow_tab: bool) -> String {
 
 impl SyntaxError {
     pub fn new(message: impl Into<String>, offset: usize, input: &[u8]) -> Self {
-        let clamped = offset.min(input.len());
-        let mut line = 1usize;
-        let mut line_start = 0usize;
+        let mut cursor = LineColCursor::new(input);
+        cursor.resolve(message, offset)
+    }
 
-        for (idx, &b) in input[..clamped].iter().enumerate() {
-            if b == b'\n' {
-                line += 1;
-                line_start = idx + 1;
-            }
+    /// Resolves `(line, col)` in-place for a slice of `SyntaxError`s in a single linear $O(N)$
+    /// pass over `input` using [`LineColCursor`] (TVEK-21).
+    pub fn resolve_in_place(diags: &mut [SyntaxError], input: &[u8]) {
+        if diags.is_empty() {
+            return;
+        }
+        if diags.len() == 1 {
+            let mut cursor = LineColCursor::new(input);
+            let (clamped, line, col) = cursor.position_at(diags[0].offset);
+            diags[0].offset = clamped;
+            diags[0].line = line;
+            diags[0].col = col;
+            return;
         }
 
-        // Exclude a trailing CR only if it is immediately part of a CRLF pair at `clamped`
-        let col_end = if clamped > line_start
-            && input[clamped - 1] == b'\r'
-            && input.get(clamped) == Some(&b'\n')
-        {
-            clamped - 1
-        } else {
-            clamped
-        };
+        // Sort indices by offset so the cursor advances strictly monotonically in O(N) total time
+        let mut indices: Vec<usize> = (0..diags.len()).collect();
+        indices.sort_by_key(|&idx| diags[idx].offset);
 
-        let col_slice = &input[line_start..col_end];
-        let mut col = 1usize;
-        for chunk in col_slice.utf8_chunks() {
-            col += chunk.valid().chars().count();
-            if !chunk.invalid().is_empty() {
-                col += 1;
-            }
-        }
-
-        Self {
-            message: message.into(),
-            offset: clamped,
-            line,
-            col,
+        let mut cursor = LineColCursor::new(input);
+        for idx in indices {
+            let (clamped, line, col) = cursor.position_at(diags[idx].offset);
+            diags[idx].offset = clamped;
+            diags[idx].line = line;
+            diags[idx].col = col;
         }
     }
 
@@ -132,6 +126,129 @@ impl SyntaxError {
             gutter_pad,
             caret_pad
         )
+    }
+}
+
+/// Stateful monotonic `(line, col)` cursor using 8-byte SWAR newline counting and incremental
+/// same-line column accumulation so multi-diagnostic resolution runs in $O(N)$ total time (TVEK-21).
+pub struct LineColCursor<'a> {
+    input: &'a [u8],
+    cur_offset: usize,
+    cur_line: usize,
+    cur_line_start: usize,
+    cur_col_offset: usize,
+    cur_col: usize,
+}
+
+impl<'a> LineColCursor<'a> {
+    #[inline]
+    pub fn new(input: &'a [u8]) -> Self {
+        Self {
+            input,
+            cur_offset: 0,
+            cur_line: 1,
+            cur_line_start: 0,
+            cur_col_offset: 0,
+            cur_col: 1,
+        }
+    }
+
+    #[inline]
+    pub fn resolve(&mut self, message: impl Into<String>, offset: usize) -> SyntaxError {
+        let (clamped, line, col) = self.position_at(offset);
+        SyntaxError {
+            message: message.into(),
+            offset: clamped,
+            line,
+            col,
+        }
+    }
+
+    pub fn position_at(&mut self, offset: usize) -> (usize, usize, usize) {
+        let clamped = offset.min(self.input.len());
+        if clamped < self.cur_offset {
+            self.cur_offset = 0;
+            self.cur_line = 1;
+            self.cur_line_start = 0;
+            self.cur_col_offset = 0;
+            self.cur_col = 1;
+        }
+
+        if clamped > self.cur_offset {
+            let delta = &self.input[self.cur_offset..clamped];
+            let mut nl_count = 0usize;
+            let mut i = 0usize;
+            while i + 8 <= delta.len() {
+                let chunk = u64::from_ne_bytes(delta[i..i + 8].try_into().unwrap());
+                let x = chunk ^ 0x0A0A_0A0A_0A0A_0A0A;
+                let mask = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+                if mask != 0 {
+                    nl_count += mask.count_ones() as usize;
+                }
+                i += 8;
+            }
+            while i < delta.len() {
+                if delta[i] == b'\n' {
+                    nl_count += 1;
+                }
+                i += 1;
+            }
+
+            if nl_count > 0 {
+                self.cur_line += nl_count;
+                let last_nl_rel = delta.iter().rposition(|&b| b == b'\n').unwrap();
+                self.cur_line_start = self.cur_offset + last_nl_rel + 1;
+                self.cur_col_offset = self.cur_line_start;
+                self.cur_col = 1;
+            }
+            self.cur_offset = clamped;
+        }
+
+        // Exclude a trailing CR only if it is immediately part of a CRLF pair at `clamped`
+        let col_end = if clamped > self.cur_line_start
+            && self.input[clamped - 1] == b'\r'
+            && self.input.get(clamped) == Some(&b'\n')
+        {
+            clamped - 1
+        } else {
+            clamped
+        };
+
+        if col_end < self.cur_col_offset {
+            self.cur_col_offset = self.cur_line_start;
+            self.cur_col = 1;
+        }
+
+        let col_slice = &self.input[self.cur_col_offset..col_end];
+        if col_slice.is_ascii() {
+            self.cur_col += col_slice.len();
+            self.cur_col_offset = col_end;
+            return (clamped, self.cur_line, self.cur_col);
+        }
+
+        // Commit all but the last 3 bytes so any mid-codepoint boundary at `col_end` is not
+        // prematurely committed as an invalid UTF-8 chunk before the next offset arrives.
+        let safe_commit_len = col_slice.len().saturating_sub(3);
+        let mut committed_bytes = 0usize;
+        let mut extra_col = 0usize;
+
+        for chunk in col_slice.utf8_chunks() {
+            let valid_str = chunk.valid();
+            let invalid_bytes = chunk.invalid();
+            let chunk_byte_len = valid_str.len() + invalid_bytes.len();
+            let valid_chars = valid_str.chars().count();
+            let invalid_chars = usize::from(!invalid_bytes.is_empty());
+
+            if committed_bytes + chunk_byte_len <= safe_commit_len {
+                self.cur_col += valid_chars + invalid_chars;
+                committed_bytes += chunk_byte_len;
+            } else {
+                extra_col += valid_chars + invalid_chars;
+            }
+        }
+        self.cur_col_offset += committed_bytes;
+
+        (clamped, self.cur_line, self.cur_col + extra_col)
     }
 }
 

@@ -3,8 +3,9 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 
 use crate::error::sanitize_for_terminal;
 use crate::lexer::{
-    format_json_with_limit, is_ident_continue, is_plain_ascii_string_chunk, lint_json_with_options,
-    FormatOptions, DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
+    format_json_with_limit, is_ident_continue, lint_json_multi_with_options, skip_ascii_spaces,
+    skip_plain_ascii_string_bytes, FormatOptions, DEFAULT_MAX_INPUT_BYTES,
+    DEFAULT_MAX_OUTPUT_BYTES, MAX_LINT_DIAGNOSTICS,
 };
 
 const MAX_HEADER_LINE_BYTES: usize = 4096;
@@ -572,35 +573,40 @@ fn publish_diagnostics_for_doc<W: Write>(
     config: &LspConfig,
 ) -> io::Result<()> {
     let max_mem = compute_lsp_max_output_bytes(config.max_input_bytes);
-    let diag_opt = match lint_json_with_options(text.as_bytes(), config.allow_comments, max_mem) {
-        Ok(()) => None,
-        Err(err) => {
-            let (line_0, char_0) = offset_to_utf16_position(text, err.offset);
-            let mut safe_off = err.offset.min(text.len());
-            while safe_off > 0 && !text.is_char_boundary(safe_off) {
-                safe_off -= 1;
-            }
-            let char_end = if safe_off < text.len() {
-                let ch_len = text[safe_off..]
-                    .chars()
-                    .next()
-                    .map(|c| {
-                        if c == '\n' || c == '\r' {
-                            0
-                        } else {
-                            c.len_utf16()
-                        }
-                    })
-                    .unwrap_or(0);
-                char_0 + ch_len
-            } else {
-                char_0
-            };
-            Some((line_0, char_0, char_end, err.message))
+    let errs = lint_json_multi_with_options(
+        text.as_bytes(),
+        config.allow_comments,
+        max_mem,
+        MAX_LINT_DIAGNOSTICS,
+    );
+    let mut diags: Vec<(usize, usize, usize, String)> = Vec::with_capacity(errs.len());
+    let mut pos_cursor = Utf16PositionCursor::new(text);
+    for err in errs {
+        let (line_0, char_0) = pos_cursor.position_at(err.offset);
+        let mut safe_off = err.offset.min(text.len());
+        while safe_off > 0 && !text.is_char_boundary(safe_off) {
+            safe_off -= 1;
         }
-    };
+        let char_end = if safe_off < text.len() {
+            let ch_len = text[safe_off..]
+                .chars()
+                .next()
+                .map(|c| {
+                    if c == '\n' || c == '\r' {
+                        0
+                    } else {
+                        c.len_utf16()
+                    }
+                })
+                .unwrap_or(0);
+            char_0 + ch_len
+        } else {
+            char_0
+        };
+        diags.push((line_0, char_0, char_end, err.message));
+    }
 
-    let notif = build_publish_diagnostics_notification(uri, diag_opt);
+    let notif = build_publish_diagnostics_notification_multi(uri, &diags);
     write_lsp_frame(writer, &notif)
 }
 
@@ -608,82 +614,149 @@ fn build_publish_diagnostics_notification(
     uri: &str,
     diag: Option<(usize, usize, usize, String)>,
 ) -> String {
+    match diag {
+        None => build_publish_diagnostics_notification_multi(uri, &[]),
+        Some(single) => build_publish_diagnostics_notification_multi(uri, &[single]),
+    }
+}
+
+fn build_publish_diagnostics_notification_multi(
+    uri: &str,
+    diags: &[(usize, usize, usize, String)],
+) -> String {
     let mut escaped_uri = String::with_capacity(uri.len());
     escape_json_string(uri, &mut escaped_uri);
 
-    match diag {
-        None => format!(
+    if diags.is_empty() {
+        return format!(
             r#"{{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{{"uri":"{}","diagnostics":[]}}}}"#,
             escaped_uri
-        ),
-        Some((line, start_char, end_char, message)) => {
-            let mut escaped_msg = String::with_capacity(message.len());
-            escape_json_string(&message, &mut escaped_msg);
-            format!(
-                concat!(
-                    r#"{{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{{"#,
-                    r#""uri":"{}","diagnostics":[{{"#,
-                    r#""range":{{"start":{{"line":{},"character":{}}},"end":{{"line":{},"character":{}}}}},"#,
-                    r#""severity":1,"source":"tvek","message":"{}""#,
-                    r#"}}]}}}}"#
-                ),
-                escaped_uri, line, start_char, line, end_char, escaped_msg
-            )
+        );
+    }
+
+    let mut out = String::with_capacity(128 + escaped_uri.len() + diags.len() * 128);
+    out.push_str(
+        r#"{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":""#,
+    );
+    out.push_str(&escaped_uri);
+    out.push_str(r#"","diagnostics":["#);
+
+    let mut escaped_msg = String::new();
+    for (idx, (line, start_char, end_char, message)) in diags.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
         }
+        escaped_msg.clear();
+        escape_json_string(message, &mut escaped_msg);
+        out.push_str(&format!(
+            concat!(
+                r#"{{"range":{{"start":{{"line":{},"character":{}}},"end":{{"line":{},"character":{}}}}},"#,
+                r#""severity":1,"source":"tvek","message":"{}"}}"#
+            ),
+            line, start_char, line, end_char, escaped_msg
+        ));
+    }
+
+    out.push_str("]}}");
+    out
+}
+
+/// Stateful forward cursor that converts monotonically increasing byte offsets in `text` into
+/// 0-indexed LSP `(line, utf16_character)` positions in a single $O(N)$ pass across `text` (TVEK-21).
+struct Utf16PositionCursor<'a> {
+    text: &'a str,
+    cur_offset: usize,
+    cur_line: usize,
+    cur_line_start: usize,
+    cur_col_offset: usize,
+    cur_utf16_col: usize,
+}
+
+impl<'a> Utf16PositionCursor<'a> {
+    #[inline]
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            cur_offset: 0,
+            cur_line: 0,
+            cur_line_start: 0,
+            cur_col_offset: 0,
+            cur_utf16_col: 0,
+        }
+    }
+
+    fn position_at(&mut self, byte_offset: usize) -> (usize, usize) {
+        let clamped = byte_offset.min(self.text.len());
+        if clamped < self.cur_offset {
+            *self = Self::new(self.text);
+        }
+
+        let full_bytes = self.text.as_bytes();
+        let slice = &full_bytes[self.cur_offset..clamped];
+        let mut newlines_in_slice = 0usize;
+        let mut i = 0usize;
+        while i + 8 <= slice.len() {
+            let chunk = u64::from_ne_bytes(slice[i..i + 8].try_into().unwrap());
+            let x = chunk ^ 0x0A0A_0A0A_0A0A_0A0A;
+            let mask = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+            if mask != 0 {
+                newlines_in_slice += mask.count_ones() as usize;
+            }
+            i += 8;
+        }
+        while i < slice.len() {
+            if slice[i] == b'\n' {
+                newlines_in_slice += 1;
+            }
+            i += 1;
+        }
+
+        if newlines_in_slice > 0 {
+            self.cur_line += newlines_in_slice;
+            let rel_last_nl = slice.iter().rposition(|&b| b == b'\n').unwrap();
+            self.cur_line_start = self.cur_offset + rel_last_nl + 1;
+            self.cur_col_offset = self.cur_line_start;
+            self.cur_utf16_col = 0;
+        }
+        self.cur_offset = clamped;
+
+        let mut col_end = if clamped > self.cur_line_start
+            && full_bytes[clamped - 1] == b'\r'
+            && full_bytes.get(clamped) == Some(&b'\n')
+        {
+            clamped - 1
+        } else {
+            clamped
+        };
+
+        while col_end > self.cur_line_start && !self.text.is_char_boundary(col_end) {
+            col_end -= 1;
+        }
+
+        if col_end < self.cur_col_offset {
+            self.cur_col_offset = self.cur_line_start;
+            self.cur_utf16_col = 0;
+        }
+
+        if col_end > self.cur_col_offset {
+            let delta = &self.text[self.cur_col_offset..col_end];
+            if delta.is_ascii() {
+                self.cur_utf16_col += delta.len();
+            } else {
+                self.cur_utf16_col += delta.chars().map(|c| c.len_utf16()).sum::<usize>();
+            }
+            self.cur_col_offset = col_end;
+        }
+
+        (self.cur_line, self.cur_utf16_col)
     }
 }
 
 /// Converts a byte offset in `text` into 0-indexed LSP `(line, utf16_character)` coordinates
-/// using 8-byte SWAR newline counting and an O(1) ASCII column fast-path (PERF-03).
+/// using 8-byte SWAR newline counting and an O(1) ASCII column fast-path (PERF-03 / TVEK-21).
 /// Safely snaps `byte_offset` down to the nearest valid UTF-8 character boundary so it can never panic (TVEK-13).
 pub fn offset_to_utf16_position(text: &str, byte_offset: usize) -> (usize, usize) {
-    let clamped = byte_offset.min(text.len());
-    let prefix = &text.as_bytes()[..clamped];
-
-    let mut line = 0usize;
-    let mut i = 0usize;
-    while i + 8 <= prefix.len() {
-        let chunk = u64::from_ne_bytes(prefix[i..i + 8].try_into().unwrap());
-        let x = chunk ^ 0x0A0A_0A0A_0A0A_0A0A;
-        let mask = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
-        if mask != 0 {
-            line += mask.count_ones() as usize;
-        }
-        i += 8;
-    }
-    while i < prefix.len() {
-        if prefix[i] == b'\n' {
-            line += 1;
-        }
-        i += 1;
-    }
-
-    let line_start = prefix
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map_or(0, |pos| pos + 1);
-
-    let full_bytes = text.as_bytes();
-    let mut col_end = if clamped > line_start
-        && full_bytes[clamped - 1] == b'\r'
-        && full_bytes.get(clamped) == Some(&b'\n')
-    {
-        clamped - 1
-    } else {
-        clamped
-    };
-
-    while col_end > line_start && !text.is_char_boundary(col_end) {
-        col_end -= 1;
-    }
-
-    let line_prefix = &text[line_start..col_end];
-    let utf16_col = if line_prefix.is_ascii() {
-        line_prefix.len()
-    } else {
-        line_prefix.chars().map(|c| c.len_utf16()).sum()
-    };
-    (line, utf16_col)
+    Utf16PositionCursor::new(text).position_at(byte_offset)
 }
 
 /// Converts a 0-indexed LSP `(target_line, target_utf16_col)` position into a valid UTF-8 byte
@@ -918,14 +991,7 @@ fn escape_json_string(s: &str, out: &mut String) {
     let mut i = 0usize;
 
     while i < bytes.len() {
-        while i + 8 <= bytes.len() {
-            let chunk = u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
-            if is_plain_ascii_string_chunk(chunk) {
-                i += 8;
-            } else {
-                break;
-            }
-        }
+        i += skip_plain_ascii_string_bytes(&bytes[i..]);
         if i >= bytes.len() {
             break;
         }
@@ -1083,15 +1149,7 @@ impl<'a> RpcParser<'a> {
     #[inline]
     fn skip_ws(&mut self) {
         while self.pos < self.input.len() {
-            while self.pos + 8 <= self.input.len() {
-                let chunk =
-                    u64::from_ne_bytes(self.input[self.pos..self.pos + 8].try_into().unwrap());
-                if chunk == 0x2020_2020_2020_2020 {
-                    self.pos += 8;
-                } else {
-                    break;
-                }
-            }
+            self.pos += skip_ascii_spaces(&self.input[self.pos..]);
             if self.pos >= self.input.len() {
                 break;
             }
@@ -1343,15 +1401,7 @@ impl<'a> RpcParser<'a> {
 
         // Scan initial unescaped run
         loop {
-            while self.pos + 8 <= self.input.len() {
-                let chunk =
-                    u64::from_ne_bytes(self.input[self.pos..self.pos + 8].try_into().unwrap());
-                if is_plain_ascii_string_chunk(chunk) {
-                    self.pos += 8;
-                } else {
-                    break;
-                }
-            }
+            self.pos += skip_plain_ascii_string_bytes(&self.input[self.pos..]);
             if self.pos >= self.input.len() {
                 return None;
             }
@@ -1422,15 +1472,7 @@ impl<'a> RpcParser<'a> {
 
             let run_start = self.pos;
             loop {
-                while self.pos + 8 <= self.input.len() {
-                    let chunk =
-                        u64::from_ne_bytes(self.input[self.pos..self.pos + 8].try_into().unwrap());
-                    if is_plain_ascii_string_chunk(chunk) {
-                        self.pos += 8;
-                    } else {
-                        break;
-                    }
-                }
+                self.pos += skip_plain_ascii_string_bytes(&self.input[self.pos..]);
                 if self.pos >= self.input.len() {
                     return None;
                 }
@@ -1867,5 +1909,87 @@ mod tests {
         obj.push('}');
         assert!(parse_rpc_value(obj.as_bytes()).is_some());
         assert!(parse_rpc_value(dup_obj.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn test_multi_diagnostic_recovery_lsp_and_lint() {
+        // Document with 3 distinct local errors in --strict mode:
+        // 1. Line comment in strict mode
+        // 2. Duplicate key "a"
+        // 3. Trailing comma before '}'
+        let doc = "{\n  // strict mode comment\n  \"a\": 1,\n  \"a\": 2,\n}\n";
+        let errs =
+            lint_json_multi_with_options(doc.as_bytes(), false, DEFAULT_MAX_OUTPUT_BYTES, 50);
+        assert_eq!(errs.len(), 3);
+        assert!(errs[0].message.contains("Comments are not allowed"));
+        assert!(errs[1].message.contains("Duplicate object key"));
+        assert!(errs[2].message.contains("Trailing comma"));
+
+        // Verify tvek server publishes all 3 diagnostics in a single publishDiagnostics notification
+        let strict_cfg = LspConfig {
+            sort_keys: false,
+            minify: false,
+            allow_comments: false,
+            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+        };
+        let mut stream = String::new();
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        ));
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///multi.json","languageId":"json","version":1,"text":"{\n  // strict mode comment\n  \"a\": 1,\n  \"a\": 2,\n}\n"}}}"#,
+        ));
+
+        let mut reader = Cursor::new(stream.into_bytes());
+        let mut writer = Vec::new();
+        let _ = run_server_loop(&mut reader, &mut writer, strict_cfg).unwrap();
+
+        let frames = read_all_frames(&writer);
+        assert_eq!(frames.len(), 2);
+        let diags = frames[1]
+            .get_field("params")
+            .and_then(|p| p.get_field("diagnostics"))
+            .and_then(|d| d.as_array())
+            .unwrap();
+        assert_eq!(diags.len(), 3);
+    }
+
+    #[test]
+    fn test_tvek_21_linear_multi_diagnostic_and_utf16_cursor() {
+        // Document with multiple errors on the same line (including 4-byte UTF-8 emojis -> 2 UTF-16 code units)
+        // and across subsequent lines to verify monotonic O(N) LineColCursor + Utf16PositionCursor accuracy.
+        let doc = concat!(
+            "{\n",
+            "  \"🚀\": 1, \"🚀\": 2, \"🚀\": 3,\n",
+            "  // strict comment\n",
+            "  \"b\": 1, \"b\": 2,\n",
+            "}\n"
+        );
+        let errs =
+            lint_json_multi_with_options(doc.as_bytes(), false, DEFAULT_MAX_OUTPUT_BYTES, 50);
+        assert_eq!(errs.len(), 5);
+
+        // Verify every multi-diagnostic error's (line, col) exactly matches single-shot SyntaxError::new
+        for err in &errs {
+            let single = crate::error::SyntaxError::new("check", err.offset, doc.as_bytes());
+            assert_eq!(
+                (err.line, err.col),
+                (single.line, single.col),
+                "LineColCursor mismatch at offset {}",
+                err.offset
+            );
+        }
+
+        // Verify incremental Utf16PositionCursor matches single-shot offset_to_utf16_position at every offset
+        let mut cursor = Utf16PositionCursor::new(doc);
+        for err in &errs {
+            let inc_pos = cursor.position_at(err.offset);
+            let single_pos = offset_to_utf16_position(doc, err.offset);
+            assert_eq!(
+                inc_pos, single_pos,
+                "Utf16PositionCursor mismatch at offset {}",
+                err.offset
+            );
+        }
     }
 }
