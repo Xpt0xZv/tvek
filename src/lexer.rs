@@ -2328,17 +2328,18 @@ unsafe fn skip_plain_ascii_string_bytes_avx2(bytes: &[u8]) -> usize {
 unsafe fn skip_plain_ascii_string_bytes_neon(bytes: &[u8]) -> usize {
     use std::arch::aarch64::*;
     let mut i = 0usize;
-    let v_quote = unsafe { vdupq_n_u8(b'"') };
-    let v_bslash = unsafe { vdupq_n_u8(b'\\') };
-    let v_space = unsafe { vdupq_n_s8(0x20) };
-
+    let v_quote = vdupq_n_u8(b'"');
+    let v_bslash = vdupq_n_u8(b'\\');
+    let v_space = vdupq_n_s8(0x20);
     while i + 16 <= bytes.len() {
+        // SAFETY: `i + 16 <= bytes.len()` is checked by the loop condition, and
+        // `vld1q_u8` supports unaligned 16-byte loads on AArch64.
         let chunk = unsafe { vld1q_u8(bytes.as_ptr().add(i)) };
-        let eq_quote = unsafe { vceqq_u8(chunk, v_quote) };
-        let eq_bslash = unsafe { vceqq_u8(chunk, v_bslash) };
-        let bad_range = unsafe { vcltq_s8(vreinterpretq_s8_u8(chunk), v_space) };
-        let special = unsafe { vorrq_u8(vorrq_u8(eq_quote, eq_bslash), bad_range) };
-        if unsafe { vmaxvq_u8(special) } != 0 {
+        let eq_quote = vceqq_u8(chunk, v_quote);
+        let eq_bslash = vceqq_u8(chunk, v_bslash);
+        let bad_range = vcltq_s8(vreinterpretq_s8_u8(chunk), v_space);
+        let special = vorrq_u8(vorrq_u8(eq_quote, eq_bslash), bad_range);
+        if vmaxvq_u8(special) != 0 {
             break;
         }
         i += 16;
@@ -2422,12 +2423,12 @@ unsafe fn skip_ascii_spaces_avx2(bytes: &[u8]) -> usize {
 unsafe fn skip_ascii_spaces_neon(bytes: &[u8]) -> usize {
     use std::arch::aarch64::*;
     let mut i = 0usize;
-    let v_space = unsafe { vdupq_n_u8(b' ') };
-
+    let v_space = vdupq_n_u8(b' ');
     while i + 16 <= bytes.len() {
+        // SAFETY: `i + 16 <= bytes.len()` is checked by the loop condition.
         let chunk = unsafe { vld1q_u8(bytes.as_ptr().add(i)) };
-        let eq_space = unsafe { vceqq_u8(chunk, v_space) };
-        if unsafe { vminvq_u8(eq_space) } != 0xFF {
+        let eq_space = vceqq_u8(chunk, v_space);
+        if vminvq_u8(eq_space) != 0xFF {
             break;
         }
         i += 16;

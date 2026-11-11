@@ -81,33 +81,62 @@ impl SyntaxError {
     }
 
     pub fn format_diagnostic(&self, filename: &str, input: &[u8]) -> String {
+        const MAX_WINDOW_SCAN_BYTES: usize = 1024;
+
         let clamped = self.offset.min(input.len());
-        let line_start = input[..clamped]
+        let back_search_start = clamped.saturating_sub(MAX_WINDOW_SCAN_BYTES);
+        let (prefix_start, is_exact_line_start) = match input[back_search_start..clamped]
             .iter()
             .rposition(|&b| b == b'\n')
-            .map(|p| p + 1)
-            .unwrap_or(0);
-
-        // Search forward only for `\n`, stripping a single trailing `\r` from `\r\n`
-        // so bare `\r` bytes earlier on the line do not truncate the snippet (IMP-01).
-        let line_end_nl = input[line_start..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|p| line_start + p)
-            .unwrap_or(input.len());
-        let line_end = if line_end_nl > line_start && input[line_end_nl - 1] == b'\r' {
-            line_end_nl - 1
-        } else {
-            line_end_nl
+        {
+            Some(rel_pos) => (back_search_start + rel_pos + 1, true),
+            None if back_search_start == 0 => (0, true),
+            None => {
+                let mut start = back_search_start;
+                while start < clamped && (input[start] & 0xC0) == 0x80 {
+                    start += 1;
+                }
+                (start, false)
+            }
         };
 
-        let raw_line = &input[line_start..line_end];
+        // Search forward up to MAX_WINDOW_SCAN_BYTES for `\n`, stripping a single trailing `\r`
+        // from `\r\n` so bare `\r` bytes earlier on the line do not truncate the snippet (IMP-01 / TVEK-21).
+        let fwd_search_end = (clamped + MAX_WINDOW_SCAN_BYTES).min(input.len());
+        let line_end = match input[clamped..fwd_search_end]
+            .iter()
+            .position(|&b| b == b'\n')
+        {
+            Some(rel_pos) => {
+                let line_end_nl = clamped + rel_pos;
+                if line_end_nl > prefix_start && input[line_end_nl - 1] == b'\r' {
+                    line_end_nl - 1
+                } else {
+                    line_end_nl
+                }
+            }
+            None => fwd_search_end,
+        };
+
+        let raw_line = &input[prefix_start..line_end];
         let safe_filename = sanitize_for_terminal(filename, false);
         let safe_message = sanitize_for_terminal(&self.message, false);
 
-        // Window long lines around `target_idx` using `.utf8_chunks()` so even huge single-line
-        // inputs containing invalid UTF-8 never allocate a full-line String (IMP-01 / R-01).
-        let target_idx = self.col.saturating_sub(1);
+        // Window long lines around `target_idx` in O(MAX_WINDOW_SCAN_BYTES) time so even huge
+        // single-line inputs with 50 diagnostics never rescan the full line (IMP-01 / R-01 / TVEK-21).
+        let target_idx = if is_exact_line_start {
+            self.col.saturating_sub(1)
+        } else {
+            let col_end = if clamped > prefix_start
+                && input[clamped - 1] == b'\r'
+                && input.get(clamped) == Some(&b'\n')
+            {
+                clamped - 1
+            } else {
+                clamped
+            };
+            count_utf8_chunk_chars(&input[prefix_start..col_end])
+        };
         let (rendered_line, caret_pad) = window_and_sanitize_line(raw_line, target_idx);
 
         let line_num_str = self.line.to_string();
@@ -127,6 +156,20 @@ impl SyntaxError {
             caret_pad
         )
     }
+}
+
+fn count_utf8_chunk_chars(slice: &[u8]) -> usize {
+    if slice.is_ascii() {
+        return slice.len();
+    }
+    let mut count = 0usize;
+    for chunk in slice.utf8_chunks() {
+        count += chunk.valid().chars().count();
+        if !chunk.invalid().is_empty() {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Stateful monotonic `(line, col)` cursor using 8-byte SWAR newline counting and incremental
@@ -226,24 +269,27 @@ impl<'a> LineColCursor<'a> {
             return (clamped, self.cur_line, self.cur_col);
         }
 
-        // Commit all but the last 3 bytes so any mid-codepoint boundary at `col_end` is not
-        // prematurely committed as an invalid UTF-8 chunk before the next offset arrives.
-        let safe_commit_len = col_slice.len().saturating_sub(3);
+        // `chunk.valid()` is guaranteed to consist of complete UTF-8 codepoints. Only a trailing
+        // `chunk.invalid()` right at `col_end` could be an incomplete prefix of a multi-byte
+        // codepoint split by `col_end`, so we commit all valid chunks and all non-trailing invalid
+        // chunks immediately (TVEK-21).
         let mut committed_bytes = 0usize;
         let mut extra_col = 0usize;
 
         for chunk in col_slice.utf8_chunks() {
             let valid_str = chunk.valid();
+            if !valid_str.is_empty() {
+                self.cur_col += valid_str.chars().count();
+                committed_bytes += valid_str.len();
+            }
             let invalid_bytes = chunk.invalid();
-            let chunk_byte_len = valid_str.len() + invalid_bytes.len();
-            let valid_chars = valid_str.chars().count();
-            let invalid_chars = usize::from(!invalid_bytes.is_empty());
-
-            if committed_bytes + chunk_byte_len <= safe_commit_len {
-                self.cur_col += valid_chars + invalid_chars;
-                committed_bytes += chunk_byte_len;
-            } else {
-                extra_col += valid_chars + invalid_chars;
+            if !invalid_bytes.is_empty() {
+                if committed_bytes + invalid_bytes.len() < col_slice.len() {
+                    self.cur_col += 1;
+                    committed_bytes += invalid_bytes.len();
+                } else {
+                    extra_col += 1;
+                }
             }
         }
         self.cur_col_offset += committed_bytes;
@@ -466,5 +512,51 @@ mod tests {
         // Ensure the diagnostic remains strictly 5 lines (no injected line breaks from U+2028/U+2029)
         let lines: Vec<&str> = diag.lines().collect();
         assert_eq!(lines.len(), 5);
+    }
+
+    #[test]
+    fn test_tvek_21_non_ascii_cursor_advancement_and_bounded_diagnostic_window() {
+        // 1. Verify `LineColCursor::position_at` advances `cur_col_offset` all the way to `col_end`
+        // on valid non-ASCII UTF-8 lines instead of staying stuck at `cur_line_start`.
+        let mut line = String::from("{\"emoji\":\"🚀\",\"pad\":\"");
+        for _ in 0..2500 {
+            line.push_str("🚀x");
+        }
+        let target_offset = line.len();
+        line.push_str("\",!,\"tail\":\"");
+        for _ in 0..2500 {
+            line.push_str("🚀y");
+        }
+        line.push_str("\"}");
+
+        let bytes = line.as_bytes();
+        let mut cursor = LineColCursor::new(bytes);
+        let (_, l1, c1) = cursor.position_at(20);
+        assert_eq!(l1, 1);
+        assert!(c1 > 1);
+        assert_eq!(cursor.cur_col_offset, 20);
+
+        let bang_offset = target_offset + 2;
+        let (_, l2, c2) = cursor.position_at(bang_offset);
+        assert_eq!(l2, 1);
+        assert_eq!(cursor.cur_col_offset, bang_offset);
+
+        let single = SyntaxError::new("Unexpected token", bang_offset, bytes);
+        assert_eq!((l2, c2), (single.line, single.col));
+
+        // 2. Verify `format_diagnostic` bounded window (> 1024 bytes before and after `bang_offset`)
+        // aligns the caret with `!` and includes both leading and trailing `...` ellipses.
+        let diag = single.format_diagnostic("huge_non_ascii.json", bytes);
+        let diag_lines: Vec<&str> = diag.lines().collect();
+        let snippet = &diag_lines[3]["1 | ".len()..];
+        assert!(snippet.starts_with("..."));
+        assert!(snippet.ends_with("..."));
+
+        let bang_char_pos = snippet.chars().position(|c| c == '!').unwrap();
+        let caret_char_pos = diag_lines[4]["  | ".len()..]
+            .chars()
+            .position(|c| c == '^')
+            .unwrap();
+        assert_eq!(bang_char_pos, caret_char_pos);
     }
 }
