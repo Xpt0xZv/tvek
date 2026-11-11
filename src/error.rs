@@ -48,72 +48,95 @@ pub fn sanitize_for_terminal(input: &str, allow_tab: bool) -> String {
 
 impl SyntaxError {
     pub fn new(message: impl Into<String>, offset: usize, input: &[u8]) -> Self {
-        let clamped = offset.min(input.len());
-        let mut line = 1usize;
-        let mut line_start = 0usize;
+        let mut cursor = LineColCursor::new(input);
+        cursor.resolve(message, offset)
+    }
 
-        for (idx, &b) in input[..clamped].iter().enumerate() {
-            if b == b'\n' {
-                line += 1;
-                line_start = idx + 1;
-            }
+    /// Resolves `(line, col)` in-place for a slice of `SyntaxError`s in a single linear $O(N)$
+    /// pass over `input` using [`LineColCursor`] (TVEK-21).
+    pub fn resolve_in_place(diags: &mut [SyntaxError], input: &[u8]) {
+        if diags.is_empty() {
+            return;
+        }
+        if diags.len() == 1 {
+            let mut cursor = LineColCursor::new(input);
+            let (clamped, line, col) = cursor.position_at(diags[0].offset);
+            diags[0].offset = clamped;
+            diags[0].line = line;
+            diags[0].col = col;
+            return;
         }
 
-        // Exclude a trailing CR only if it is immediately part of a CRLF pair at `clamped`
-        let col_end = if clamped > line_start
-            && input[clamped - 1] == b'\r'
-            && input.get(clamped) == Some(&b'\n')
-        {
-            clamped - 1
-        } else {
-            clamped
-        };
+        // Sort indices by offset so the cursor advances strictly monotonically in O(N) total time
+        let mut indices: Vec<usize> = (0..diags.len()).collect();
+        indices.sort_by_key(|&idx| diags[idx].offset);
 
-        let col_slice = &input[line_start..col_end];
-        let mut col = 1usize;
-        for chunk in col_slice.utf8_chunks() {
-            col += chunk.valid().chars().count();
-            if !chunk.invalid().is_empty() {
-                col += 1;
-            }
-        }
-
-        Self {
-            message: message.into(),
-            offset: clamped,
-            line,
-            col,
+        let mut cursor = LineColCursor::new(input);
+        for idx in indices {
+            let (clamped, line, col) = cursor.position_at(diags[idx].offset);
+            diags[idx].offset = clamped;
+            diags[idx].line = line;
+            diags[idx].col = col;
         }
     }
 
     pub fn format_diagnostic(&self, filename: &str, input: &[u8]) -> String {
+        const MAX_WINDOW_SCAN_BYTES: usize = 1024;
+
         let clamped = self.offset.min(input.len());
-        let line_start = input[..clamped]
+        let back_search_start = clamped.saturating_sub(MAX_WINDOW_SCAN_BYTES);
+        let (prefix_start, is_exact_line_start) = match input[back_search_start..clamped]
             .iter()
             .rposition(|&b| b == b'\n')
-            .map(|p| p + 1)
-            .unwrap_or(0);
-
-        // Search forward only for `\n`, stripping a single trailing `\r` from `\r\n`
-        // so bare `\r` bytes earlier on the line do not truncate the snippet (IMP-01).
-        let line_end_nl = input[line_start..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|p| line_start + p)
-            .unwrap_or(input.len());
-        let line_end = if line_end_nl > line_start && input[line_end_nl - 1] == b'\r' {
-            line_end_nl - 1
-        } else {
-            line_end_nl
+        {
+            Some(rel_pos) => (back_search_start + rel_pos + 1, true),
+            None if back_search_start == 0 => (0, true),
+            None => {
+                let mut start = back_search_start;
+                while start < clamped && (input[start] & 0xC0) == 0x80 {
+                    start += 1;
+                }
+                (start, false)
+            }
         };
 
-        let raw_line = &input[line_start..line_end];
+        // Search forward up to MAX_WINDOW_SCAN_BYTES for `\n`, stripping a single trailing `\r`
+        // from `\r\n` so bare `\r` bytes earlier on the line do not truncate the snippet (IMP-01 / TVEK-21).
+        let fwd_search_end = (clamped + MAX_WINDOW_SCAN_BYTES).min(input.len());
+        let line_end = match input[clamped..fwd_search_end]
+            .iter()
+            .position(|&b| b == b'\n')
+        {
+            Some(rel_pos) => {
+                let line_end_nl = clamped + rel_pos;
+                if line_end_nl > prefix_start && input[line_end_nl - 1] == b'\r' {
+                    line_end_nl - 1
+                } else {
+                    line_end_nl
+                }
+            }
+            None => fwd_search_end,
+        };
+
+        let raw_line = &input[prefix_start..line_end];
         let safe_filename = sanitize_for_terminal(filename, false);
         let safe_message = sanitize_for_terminal(&self.message, false);
 
-        // Window long lines around `target_idx` using `.utf8_chunks()` so even huge single-line
-        // inputs containing invalid UTF-8 never allocate a full-line String (IMP-01 / R-01).
-        let target_idx = self.col.saturating_sub(1);
+        // Window long lines around `target_idx` in O(MAX_WINDOW_SCAN_BYTES) time so even huge
+        // single-line inputs with 50 diagnostics never rescan the full line (IMP-01 / R-01 / TVEK-21).
+        let target_idx = if is_exact_line_start {
+            self.col.saturating_sub(1)
+        } else {
+            let col_end = if clamped > prefix_start
+                && input[clamped - 1] == b'\r'
+                && input.get(clamped) == Some(&b'\n')
+            {
+                clamped - 1
+            } else {
+                clamped
+            };
+            count_utf8_chunk_chars(&input[prefix_start..col_end])
+        };
         let (rendered_line, caret_pad) = window_and_sanitize_line(raw_line, target_idx);
 
         let line_num_str = self.line.to_string();
@@ -132,6 +155,146 @@ impl SyntaxError {
             gutter_pad,
             caret_pad
         )
+    }
+}
+
+fn count_utf8_chunk_chars(slice: &[u8]) -> usize {
+    if slice.is_ascii() {
+        return slice.len();
+    }
+    let mut count = 0usize;
+    for chunk in slice.utf8_chunks() {
+        count += chunk.valid().chars().count();
+        if !chunk.invalid().is_empty() {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Stateful monotonic `(line, col)` cursor using 8-byte SWAR newline counting and incremental
+/// same-line column accumulation so multi-diagnostic resolution runs in $O(N)$ total time (TVEK-21).
+pub struct LineColCursor<'a> {
+    input: &'a [u8],
+    cur_offset: usize,
+    cur_line: usize,
+    cur_line_start: usize,
+    cur_col_offset: usize,
+    cur_col: usize,
+}
+
+impl<'a> LineColCursor<'a> {
+    #[inline]
+    pub fn new(input: &'a [u8]) -> Self {
+        Self {
+            input,
+            cur_offset: 0,
+            cur_line: 1,
+            cur_line_start: 0,
+            cur_col_offset: 0,
+            cur_col: 1,
+        }
+    }
+
+    #[inline]
+    pub fn resolve(&mut self, message: impl Into<String>, offset: usize) -> SyntaxError {
+        let (clamped, line, col) = self.position_at(offset);
+        SyntaxError {
+            message: message.into(),
+            offset: clamped,
+            line,
+            col,
+        }
+    }
+
+    pub fn position_at(&mut self, offset: usize) -> (usize, usize, usize) {
+        let clamped = offset.min(self.input.len());
+        if clamped < self.cur_offset {
+            self.cur_offset = 0;
+            self.cur_line = 1;
+            self.cur_line_start = 0;
+            self.cur_col_offset = 0;
+            self.cur_col = 1;
+        }
+
+        if clamped > self.cur_offset {
+            let delta = &self.input[self.cur_offset..clamped];
+            let mut nl_count = 0usize;
+            let mut i = 0usize;
+            while i + 8 <= delta.len() {
+                let chunk = u64::from_ne_bytes(delta[i..i + 8].try_into().unwrap());
+                let x = chunk ^ 0x0A0A_0A0A_0A0A_0A0A;
+                let mask = x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080;
+                if mask != 0 {
+                    nl_count += mask.count_ones() as usize;
+                }
+                i += 8;
+            }
+            while i < delta.len() {
+                if delta[i] == b'\n' {
+                    nl_count += 1;
+                }
+                i += 1;
+            }
+
+            if nl_count > 0 {
+                self.cur_line += nl_count;
+                let last_nl_rel = delta.iter().rposition(|&b| b == b'\n').unwrap();
+                self.cur_line_start = self.cur_offset + last_nl_rel + 1;
+                self.cur_col_offset = self.cur_line_start;
+                self.cur_col = 1;
+            }
+            self.cur_offset = clamped;
+        }
+
+        // Exclude a trailing CR only if it is immediately part of a CRLF pair at `clamped`
+        let col_end = if clamped > self.cur_line_start
+            && self.input[clamped - 1] == b'\r'
+            && self.input.get(clamped) == Some(&b'\n')
+        {
+            clamped - 1
+        } else {
+            clamped
+        };
+
+        if col_end < self.cur_col_offset {
+            self.cur_col_offset = self.cur_line_start;
+            self.cur_col = 1;
+        }
+
+        let col_slice = &self.input[self.cur_col_offset..col_end];
+        if col_slice.is_ascii() {
+            self.cur_col += col_slice.len();
+            self.cur_col_offset = col_end;
+            return (clamped, self.cur_line, self.cur_col);
+        }
+
+        // `chunk.valid()` is guaranteed to consist of complete UTF-8 codepoints. Only a trailing
+        // `chunk.invalid()` right at `col_end` could be an incomplete prefix of a multi-byte
+        // codepoint split by `col_end`, so we commit all valid chunks and all non-trailing invalid
+        // chunks immediately (TVEK-21).
+        let mut committed_bytes = 0usize;
+        let mut extra_col = 0usize;
+
+        for chunk in col_slice.utf8_chunks() {
+            let valid_str = chunk.valid();
+            if !valid_str.is_empty() {
+                self.cur_col += valid_str.chars().count();
+                committed_bytes += valid_str.len();
+            }
+            let invalid_bytes = chunk.invalid();
+            if !invalid_bytes.is_empty() {
+                if committed_bytes + invalid_bytes.len() < col_slice.len() {
+                    self.cur_col += 1;
+                    committed_bytes += invalid_bytes.len();
+                } else {
+                    extra_col += 1;
+                }
+            }
+        }
+        self.cur_col_offset += committed_bytes;
+
+        (clamped, self.cur_line, self.cur_col + extra_col)
     }
 }
 
@@ -349,5 +512,51 @@ mod tests {
         // Ensure the diagnostic remains strictly 5 lines (no injected line breaks from U+2028/U+2029)
         let lines: Vec<&str> = diag.lines().collect();
         assert_eq!(lines.len(), 5);
+    }
+
+    #[test]
+    fn test_tvek_21_non_ascii_cursor_advancement_and_bounded_diagnostic_window() {
+        // 1. Verify `LineColCursor::position_at` advances `cur_col_offset` all the way to `col_end`
+        // on valid non-ASCII UTF-8 lines instead of staying stuck at `cur_line_start`.
+        let mut line = String::from("{\"emoji\":\"🚀\",\"pad\":\"");
+        for _ in 0..2500 {
+            line.push_str("🚀x");
+        }
+        let target_offset = line.len();
+        line.push_str("\",!,\"tail\":\"");
+        for _ in 0..2500 {
+            line.push_str("🚀y");
+        }
+        line.push_str("\"}");
+
+        let bytes = line.as_bytes();
+        let mut cursor = LineColCursor::new(bytes);
+        let (_, l1, c1) = cursor.position_at(20);
+        assert_eq!(l1, 1);
+        assert!(c1 > 1);
+        assert_eq!(cursor.cur_col_offset, 20);
+
+        let bang_offset = target_offset + 2;
+        let (_, l2, c2) = cursor.position_at(bang_offset);
+        assert_eq!(l2, 1);
+        assert_eq!(cursor.cur_col_offset, bang_offset);
+
+        let single = SyntaxError::new("Unexpected token", bang_offset, bytes);
+        assert_eq!((l2, c2), (single.line, single.col));
+
+        // 2. Verify `format_diagnostic` bounded window (> 1024 bytes before and after `bang_offset`)
+        // aligns the caret with `!` and includes both leading and trailing `...` ellipses.
+        let diag = single.format_diagnostic("huge_non_ascii.json", bytes);
+        let diag_lines: Vec<&str> = diag.lines().collect();
+        let snippet = &diag_lines[3]["1 | ".len()..];
+        assert!(snippet.starts_with("..."));
+        assert!(snippet.ends_with("..."));
+
+        let bang_char_pos = snippet.chars().position(|c| c == '!').unwrap();
+        let caret_char_pos = diag_lines[4]["  | ".len()..]
+            .chars()
+            .position(|c| c == '^')
+            .unwrap();
+        assert_eq!(bang_char_pos, caret_char_pos);
     }
 }

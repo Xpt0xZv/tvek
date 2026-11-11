@@ -55,7 +55,7 @@ tvek server [OPTIONS]
 | `--max-size <BYTES>` | Maximum input size in bytes (default: `104857600` / 100 MiB) |
 | `--lsp` | Start the Language Server Protocol (LSP) server over stdio (alias for `tvek server`) |
 | `-q, --quiet` | Suppress non-error output |
-| `-v, --version` | Print `tvek 0.1.0` and exit `0` |
+| `-v, --version` | Print `tvek 0.1.2` and exit `0` |
 | `-h, --help` | Print CLI help documentation and exit `0` |
 
 ## Language Server (`tvek server`)

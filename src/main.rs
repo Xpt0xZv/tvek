@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tvek::error::sanitize_for_terminal;
 use tvek::lexer::{
-    format_json, format_json_with_limit, lint_json_with_options, FormatOptions,
-    DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_OUTPUT_BYTES,
+    format_json_into_buf, lint_json_multi_with_options, FormatOptions, DEFAULT_MAX_INPUT_BYTES,
+    DEFAULT_MAX_OUTPUT_BYTES, MAX_LINT_DIAGNOSTICS,
 };
 use tvek::lsp::{run_stdio_server, LspConfig};
 
@@ -20,6 +20,8 @@ const VERSION: &str = concat!("tvek ", env!("CARGO_PKG_VERSION"));
 const MAX_DIR_DEPTH: usize = 64;
 const MAX_DISCOVERED_FILES: usize = 100_000;
 const MAX_READ_PREALLOC_BYTES: usize = 16 * 1024 * 1024; // 16 MiB cap on file read pre-allocation
+const MAX_RETAINED_WORKER_BUF_CAPACITY: usize = 4 * 1024 * 1024; // 4 MiB RSS cap per worker buffer
+const SHRINK_TARGET_CAPACITY: usize = 256 * 1024; // 256 KiB target after shrinking oversized buffer
 const TEMP_FILE_MAX_ATTEMPTS: u32 = 64;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -445,6 +447,32 @@ fn collect_json_files_in_dir_with_limit(
     }
 }
 
+struct WorkerBuffers {
+    input: Vec<u8>,
+    output: Vec<u8>,
+}
+
+impl WorkerBuffers {
+    fn new() -> Self {
+        Self {
+            input: Vec::with_capacity(64 * 1024),
+            output: Vec::with_capacity(64 * 1024),
+        }
+    }
+
+    #[inline]
+    fn reset_after_file(&mut self) {
+        self.input.clear();
+        if self.input.capacity() > MAX_RETAINED_WORKER_BUF_CAPACITY {
+            self.input.shrink_to(SHRINK_TARGET_CAPACITY);
+        }
+        self.output.clear();
+        if self.output.capacity() > MAX_RETAINED_WORKER_BUF_CAPACITY {
+            self.output.shrink_to(SHRINK_TARGET_CAPACITY);
+        }
+    }
+}
+
 /// Bounded reader that reads at most `max_bytes` from `reader`, returning an error
 /// if the stream exceeds `max_bytes` (TVEK-02 / CWE-400).
 fn read_reader_bounded<R: Read>(reader: R, max_bytes: usize) -> io::Result<Vec<u8>> {
@@ -457,6 +485,19 @@ fn read_reader_bounded_with_hint<R: Read>(
     max_bytes: usize,
     size_hint: Option<u64>,
 ) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    read_reader_bounded_into(reader, max_bytes, size_hint, &mut buf)?;
+    Ok(buf)
+}
+
+/// Bounded reader that reuses an existing `Vec<u8>` buffer while enforcing `max_bytes` (PERF-06 / PERF-08).
+fn read_reader_bounded_into<R: Read>(
+    reader: R,
+    max_bytes: usize,
+    size_hint: Option<u64>,
+    buf: &mut Vec<u8>,
+) -> io::Result<()> {
+    buf.clear();
     let limit = (max_bytes as u64).saturating_add(1);
     let initial_cap = match size_hint {
         Some(hint) => (hint as usize)
@@ -465,21 +506,31 @@ fn read_reader_bounded_with_hint<R: Read>(
             .saturating_add(1),
         None => 8192.min(max_bytes.saturating_add(1)),
     };
-    let mut buf = Vec::with_capacity(initial_cap);
-    reader.take(limit).read_to_end(&mut buf)?;
+    if buf.capacity() < initial_cap {
+        buf.reserve(initial_cap - buf.capacity());
+    }
+    reader.take(limit).read_to_end(buf)?;
     if buf.len() > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Input exceeds maximum allowed size of {} bytes", max_bytes),
         ));
     }
-    Ok(buf)
+    Ok(())
 }
 
 /// Bounded file reader that opens the file handle first (eliminating path-based TOCTOU),
 /// verifies `meta.is_file()` (rejecting FIFOs, sockets, and device nodes), and enforces
 /// `max_bytes` with single-allocation buffer reservation (TVEK-02 / TVEK-07 / PERF-06).
+#[cfg(test)]
 fn read_file_bounded(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    read_file_bounded_into(path, max_bytes, &mut buf)?;
+    Ok(buf)
+}
+
+/// Bounded file reader into a caller-provided reusable `Vec<u8>` buffer (PERF-08).
+fn read_file_bounded_into(path: &Path, max_bytes: usize, buf: &mut Vec<u8>) -> io::Result<()> {
     let file = fs::File::open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() {
@@ -498,7 +549,7 @@ fn read_file_bounded(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
             ),
         ));
     }
-    read_reader_bounded_with_hint(file, max_bytes, Some(file_len))
+    read_reader_bounded_into(file, max_bytes, Some(file_len), buf)
 }
 
 /// Generates a non-predictable 64-bit token mixing PID, system clock nanoseconds,
@@ -657,33 +708,51 @@ fn process_buffer(
     has_lint_or_check_err: &AtomicBool,
     has_io_err: &AtomicBool,
 ) {
+    let mut out_buf = Vec::new();
+    process_buffer_with_output(
+        display_name,
+        file_path,
+        input,
+        &mut out_buf,
+        cfg,
+        has_lint_or_check_err,
+        has_io_err,
+    );
+}
+
+fn process_buffer_with_output(
+    display_name: &str,
+    file_path: Option<&Path>,
+    input: &[u8],
+    formatted: &mut Vec<u8>,
+    cfg: &CliConfig,
+    has_lint_or_check_err: &AtomicBool,
+    has_io_err: &AtomicBool,
+) {
     let safe_display = sanitize_for_terminal(display_name, false);
+    let max_output_bytes = compute_max_output_bytes(cfg.max_input_bytes);
 
     if cfg.lint {
-        let max_mem = compute_max_output_bytes(cfg.max_input_bytes);
-        let res = lint_json_with_options(input, cfg.format_opts.allow_comments, max_mem);
-        if let Err(err) = res {
-            write_stderr_line(&err.format_diagnostic(&safe_display, input));
+        let errs = lint_json_multi_with_options(
+            input,
+            cfg.format_opts.allow_comments,
+            max_output_bytes,
+            MAX_LINT_DIAGNOSTICS,
+        );
+        if !errs.is_empty() {
+            for err in &errs {
+                write_stderr_line(&err.format_diagnostic(&safe_display, input));
+            }
             has_lint_or_check_err.store(true, Ordering::Relaxed);
         }
         return;
     }
 
-    let formatted = if cfg.max_input_bytes == DEFAULT_MAX_INPUT_BYTES {
-        format_json(input, &cfg.format_opts)
-    } else {
-        let max_output_bytes = compute_max_output_bytes(cfg.max_input_bytes);
-        format_json_with_limit(input, &cfg.format_opts, max_output_bytes)
-    };
-
-    let formatted = match formatted {
-        Ok(buf) => buf,
-        Err(err) => {
-            write_stderr_line(&err.format_diagnostic(&safe_display, input));
-            has_lint_or_check_err.store(true, Ordering::Relaxed);
-            return;
-        }
-    };
+    if let Err(err) = format_json_into_buf(input, &cfg.format_opts, max_output_bytes, formatted) {
+        write_stderr_line(&err.format_diagnostic(&safe_display, input));
+        has_lint_or_check_err.store(true, Ordering::Relaxed);
+        return;
+    }
 
     if cfg.check {
         if formatted.as_slice() != input {
@@ -703,7 +772,7 @@ fn process_buffer(
                 return;
             }
             if formatted.as_slice() != input {
-                if let Err(e) = write_file_atomically(path, &formatted) {
+                if let Err(e) = write_file_atomically(path, formatted) {
                     write_stderr_line(&format!("error: Failed to write '{}': {}", safe_display, e));
                     has_io_err.store(true, Ordering::Relaxed);
                 } else if !cfg.quiet {
@@ -717,7 +786,7 @@ fn process_buffer(
     if !cfg.quiet {
         let stdout = io::stdout();
         let mut handle = stdout.lock();
-        if let Err(e) = handle.write_all(&formatted) {
+        if let Err(e) = handle.write_all(formatted) {
             write_stderr_line(&format!("error: Failed to write to stdout: {}", e));
             has_io_err.store(true, Ordering::Relaxed);
         }
@@ -889,8 +958,16 @@ fn process_file_batch_with_dedup(
     };
 
     if worker_count <= 1 {
+        let mut buffers = WorkerBuffers::new();
         for file_path in files {
-            process_single_file(file_path, cfg, has_lint_or_check_err, has_io_err);
+            process_single_file_with_buffers(
+                file_path,
+                &mut buffers,
+                cfg,
+                has_lint_or_check_err,
+                has_io_err,
+            );
+            buffers.reset_after_file();
         }
         return;
     }
@@ -898,30 +975,42 @@ fn process_file_batch_with_dedup(
     let next_idx = AtomicUsize::new(0);
     thread::scope(|s| {
         for _ in 0..worker_count {
-            s.spawn(|| loop {
-                let idx = next_idx.fetch_add(1, Ordering::Relaxed);
-                if idx >= files.len() {
-                    break;
+            s.spawn(|| {
+                let mut buffers = WorkerBuffers::new();
+                loop {
+                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                    if idx >= files.len() {
+                        break;
+                    }
+                    process_single_file_with_buffers(
+                        &files[idx],
+                        &mut buffers,
+                        cfg,
+                        has_lint_or_check_err,
+                        has_io_err,
+                    );
+                    buffers.reset_after_file();
                 }
-                process_single_file(&files[idx], cfg, has_lint_or_check_err, has_io_err);
             });
         }
     });
 }
 
-fn process_single_file(
+fn process_single_file_with_buffers(
     file_path: &Path,
+    buffers: &mut WorkerBuffers,
     cfg: &CliConfig,
     has_lint_or_check_err: &AtomicBool,
     has_io_err: &AtomicBool,
 ) {
     let display = file_path.to_string_lossy();
-    match read_file_bounded(file_path, cfg.max_input_bytes) {
-        Ok(bytes) => {
-            process_buffer(
+    match read_file_bounded_into(file_path, cfg.max_input_bytes, &mut buffers.input) {
+        Ok(()) => {
+            process_buffer_with_output(
                 &display,
                 Some(file_path),
-                &bytes,
+                &buffers.input,
+                &mut buffers.output,
                 cfg,
                 has_lint_or_check_err,
                 has_io_err,
@@ -1501,5 +1590,39 @@ mod tests {
         assert_eq!(deduped.len(), 70);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_worker_buffers_reuse_and_shrink_cap() {
+        let mut buffers = WorkerBuffers::new();
+        assert!(buffers.input.capacity() >= 64 * 1024);
+        assert!(buffers.output.capacity() >= 64 * 1024);
+
+        // 1. Normal buffer (<= 4 MiB) retains its allocated capacity across files
+        buffers.input.resize(512 * 1024, b' ');
+        buffers.output.resize(512 * 1024, b' ');
+        let retained_in_cap = buffers.input.capacity();
+        let retained_out_cap = buffers.output.capacity();
+        buffers.reset_after_file();
+        assert!(buffers.input.is_empty());
+        assert!(buffers.output.is_empty());
+        assert_eq!(buffers.input.capacity(), retained_in_cap);
+        assert_eq!(buffers.output.capacity(), retained_out_cap);
+
+        // 2. Oversized buffer (> 4 MiB) shrinks back to SHRINK_TARGET_CAPACITY (256 KiB)
+        buffers
+            .input
+            .reserve(MAX_RETAINED_WORKER_BUF_CAPACITY + 1024 * 1024);
+        buffers
+            .output
+            .reserve(MAX_RETAINED_WORKER_BUF_CAPACITY + 1024 * 1024);
+        assert!(buffers.input.capacity() > MAX_RETAINED_WORKER_BUF_CAPACITY);
+        assert!(buffers.output.capacity() > MAX_RETAINED_WORKER_BUF_CAPACITY);
+
+        buffers.reset_after_file();
+        assert!(buffers.input.capacity() <= MAX_RETAINED_WORKER_BUF_CAPACITY);
+        assert!(buffers.input.capacity() >= SHRINK_TARGET_CAPACITY);
+        assert!(buffers.output.capacity() <= MAX_RETAINED_WORKER_BUF_CAPACITY);
+        assert!(buffers.output.capacity() >= SHRINK_TARGET_CAPACITY);
     }
 }
