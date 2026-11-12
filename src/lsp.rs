@@ -61,6 +61,11 @@ pub fn run_stdio_server(config: LspConfig) -> u8 {
     }
 }
 
+struct OpenDocument {
+    text: String,
+    has_diagnostics: bool,
+}
+
 /// Core LSP message loop parameterized over `BufRead` and `Write` for deterministic unit testing.
 pub fn run_server_loop<R: BufRead, W: Write>(
     reader: &mut R,
@@ -70,7 +75,7 @@ pub fn run_server_loop<R: BufRead, W: Write>(
     let host_max_input_bytes = config.max_input_bytes.min(DEFAULT_MAX_INPUT_BYTES);
     config.max_input_bytes = host_max_input_bytes;
 
-    let mut documents: HashMap<String, String> = HashMap::new();
+    let mut documents: HashMap<String, OpenDocument> = HashMap::new();
     let mut total_open_bytes: usize = 0;
     let mut initialized = false;
     let mut shutdown_requested = false;
@@ -145,7 +150,7 @@ pub fn run_server_loop<R: BufRead, W: Write>(
                     let resp = format!(
                         concat!(
                             r#"{{"jsonrpc":"2.0","id":{},"result":{{"#,
-                            r#""capabilities":{{"textDocumentSync":{{"openClose":true,"change":2}},"documentFormattingProvider":true}},"#,
+                            r#""capabilities":{{"textDocumentSync":{{"openClose":true,"change":2}},"documentFormattingProvider":true,"codeActionProvider":{{"codeActionKinds":["quickfix","source.fixAll","source.fixAll.tvek"]}}}},"#,
                             r#""serverInfo":{{"name":"tvek","version":""#,
                             env!("CARGO_PKG_VERSION"),
                             r#""}}"#,
@@ -231,11 +236,12 @@ pub fn run_server_loop<R: BufRead, W: Write>(
                     continue;
                 };
 
-                let Some(doc_text) = documents.get(uri) else {
+                let Some(doc) = documents.get(uri) else {
                     let resp = format!(r#"{{"jsonrpc":"2.0","id":{},"result":[]}}"#, id_str);
                     write_lsp_frame(writer, &resp)?;
                     continue;
                 };
+                let doc_text = &doc.text;
 
                 let (tab_size, insert_spaces) = extract_formatting_options(params);
                 let indent = if insert_spaces {
@@ -249,6 +255,7 @@ pub fn run_server_loop<R: BufRead, W: Write>(
                     sort_keys: config.sort_keys,
                     allow_comments: config.allow_comments,
                     line_width: config.line_width,
+                    fix: false,
                 };
 
                 let max_out = compute_lsp_max_output_bytes(config.max_input_bytes);
@@ -285,6 +292,100 @@ pub fn run_server_loop<R: BufRead, W: Write>(
                     }
                 }
             }
+            "textDocument/codeAction" => {
+                let Some(id_str) = id_raw else {
+                    continue;
+                };
+                let uri_opt = params
+                    .and_then(|p| p.get_field("textDocument"))
+                    .and_then(|td| td.get_field("uri"))
+                    .and_then(|v| v.as_str());
+
+                let Some(uri) = uri_opt else {
+                    let resp = format!(r#"{{"jsonrpc":"2.0","id":{},"result":[]}}"#, id_str);
+                    write_lsp_frame(writer, &resp)?;
+                    continue;
+                };
+
+                let Some(doc) = documents.get(uri) else {
+                    let resp = format!(r#"{{"jsonrpc":"2.0","id":{},"result":[]}}"#, id_str);
+                    write_lsp_frame(writer, &resp)?;
+                    continue;
+                };
+
+                // TVEK-22: O(1) cached diagnostic check avoids re-linting valid documents on every cursor move
+                if !doc.has_diagnostics {
+                    let resp = format!(r#"{{"jsonrpc":"2.0","id":{},"result":[]}}"#, id_str);
+                    write_lsp_frame(writer, &resp)?;
+                    continue;
+                }
+
+                // TVEK-22: Respect params.context.only and emit a single matching CodeAction
+                let Some((action_title, action_kind, is_preferred)) =
+                    select_code_action_kind(params)
+                else {
+                    let resp = format!(r#"{{"jsonrpc":"2.0","id":{},"result":[]}}"#, id_str);
+                    write_lsp_frame(writer, &resp)?;
+                    continue;
+                };
+
+                let max_out = compute_lsp_max_output_bytes(config.max_input_bytes);
+                let fix_opts = FormatOptions {
+                    minify: config.minify,
+                    indent: 2,
+                    sort_keys: config.sort_keys,
+                    allow_comments: config.allow_comments,
+                    line_width: config.line_width,
+                    fix: true,
+                };
+
+                match format_json_with_limit(doc.text.as_bytes(), &fix_opts, max_out) {
+                    Ok(fixed_bytes) => {
+                        if let Ok(fixed_str) = String::from_utf8(fixed_bytes) {
+                            let (end_line, end_char) = end_position_utf16(&doc.text);
+                            // TVEK-22: Stream escaped URI and document text directly into `resp`
+                            // without allocating intermediate `escaped_new_text` or duplicate `edit_json` buffers.
+                            let mut resp = String::with_capacity(
+                                fixed_str
+                                    .len()
+                                    .saturating_add(uri.len())
+                                    .saturating_add(256),
+                            );
+                            resp.push_str(r#"{"jsonrpc":"2.0","id":"#);
+                            resp.push_str(&id_str);
+                            resp.push_str(r#","result":[{"title":""#);
+                            resp.push_str(action_title);
+                            resp.push_str(r#"","kind":""#);
+                            resp.push_str(action_kind);
+                            if is_preferred {
+                                resp.push_str(r#"","isPreferred":true,"edit":{"changes":{""#);
+                            } else {
+                                resp.push_str(r#"","edit":{"changes":{""#);
+                            }
+                            escape_json_string(uri, &mut resp);
+                            resp.push_str(
+                                r#"":[{"range":{"start":{"line":0,"character":0},"end":{"line":"#,
+                            );
+                            resp.push_str(&end_line.to_string());
+                            resp.push_str(r#","character":"#);
+                            resp.push_str(&end_char.to_string());
+                            resp.push_str(r#"}},"newText":""#);
+                            escape_json_string(&fixed_str, &mut resp);
+                            drop(fixed_str);
+                            resp.push_str(r#""}]}}}]}"#);
+                            write_lsp_frame(writer, &resp)?;
+                        } else {
+                            let resp =
+                                format!(r#"{{"jsonrpc":"2.0","id":{},"result":[]}}"#, id_str);
+                            write_lsp_frame(writer, &resp)?;
+                        }
+                    }
+                    Err(_) => {
+                        let resp = format!(r#"{{"jsonrpc":"2.0","id":{},"result":[]}}"#, id_str);
+                        write_lsp_frame(writer, &resp)?;
+                    }
+                }
+            }
             _ => {
                 if let Some(id_str) = id_raw {
                     let resp = format!(
@@ -301,14 +402,14 @@ pub fn run_server_loop<R: BufRead, W: Write>(
 }
 
 fn evict_document(
-    documents: &mut HashMap<String, String>,
+    documents: &mut HashMap<String, OpenDocument>,
     total_open_bytes: &mut usize,
     uri: &str,
 ) -> Option<String> {
-    if let Some(old_text) = documents.remove(uri) {
-        let removed_cost = uri.len().saturating_add(old_text.len());
+    if let Some(old_doc) = documents.remove(uri) {
+        let removed_cost = uri.len().saturating_add(old_doc.text.len());
         *total_open_bytes = total_open_bytes.saturating_sub(removed_cost);
-        Some(old_text)
+        Some(old_doc.text)
     } else {
         None
     }
@@ -320,7 +421,7 @@ fn evict_document(
 /// never format stale text (TVEK-10 / TVEK-11).
 fn handle_document_update<W: Write>(
     writer: &mut W,
-    documents: &mut HashMap<String, String>,
+    documents: &mut HashMap<String, OpenDocument>,
     total_open_bytes: &mut usize,
     uri: &str,
     text: &str,
@@ -355,9 +456,16 @@ fn handle_document_update<W: Write>(
         return write_lsp_frame(writer, &notif);
     }
 
+    let has_diagnostics = publish_diagnostics_for_doc(writer, uri, text, config)?;
     *total_open_bytes = total_open_bytes.saturating_add(entry_cost);
-    documents.insert(uri.to_string(), text.to_string());
-    publish_diagnostics_for_doc(writer, uri, text, config)
+    documents.insert(
+        uri.to_string(),
+        OpenDocument {
+            text: text.to_string(),
+            has_diagnostics,
+        },
+    );
+    Ok(())
 }
 
 /// Applies a sequence of full or incremental (`textDocumentSync: 2`) content changes to `uri` in-place
@@ -365,7 +473,7 @@ fn handle_document_update<W: Write>(
 /// (PERF-03 / TVEK-10 / TVEK-11 / TVEK-19).
 fn handle_document_changes<W: Write>(
     writer: &mut W,
-    documents: &mut HashMap<String, String>,
+    documents: &mut HashMap<String, OpenDocument>,
     total_open_bytes: &mut usize,
     uri: &str,
     changes: &[RpcValue],
@@ -429,9 +537,15 @@ fn handle_document_changes<W: Write>(
         return write_lsp_frame(writer, &notif);
     }
 
-    publish_diagnostics_for_doc(writer, uri, &doc, config)?;
+    let has_diagnostics = publish_diagnostics_for_doc(writer, uri, &doc, config)?;
     *total_open_bytes = total_open_bytes.saturating_add(entry_cost);
-    documents.insert(uri.to_string(), doc);
+    documents.insert(
+        uri.to_string(),
+        OpenDocument {
+            text: doc,
+            has_diagnostics,
+        },
+    );
     Ok(())
 }
 
@@ -583,12 +697,52 @@ fn extract_formatting_options(params: Option<&RpcValue>) -> (usize, bool) {
     (tab_size, insert_spaces)
 }
 
+fn select_code_action_kind(
+    params: Option<&RpcValue>,
+) -> Option<(&'static str, &'static str, bool)> {
+    let only_arr = params
+        .and_then(|p| p.get_field("context"))
+        .and_then(|c| c.get_field("only"))
+        .and_then(|o| o.as_array());
+
+    let Some(arr) = only_arr else {
+        return Some(("Fix JSON syntax issues (tvek)", "quickfix", true));
+    };
+    if arr.is_empty() {
+        return Some(("Fix JSON syntax issues (tvek)", "quickfix", true));
+    }
+
+    let mut wants_quickfix = false;
+    let mut wants_fix_all = false;
+    for item in arr {
+        if let Some(kind) = item.as_str() {
+            if kind == "quickfix" || kind.starts_with("quickfix.") {
+                wants_quickfix = true;
+            } else if kind == "source" || kind == "source.fixAll" || kind == "source.fixAll.tvek" {
+                wants_fix_all = true;
+            }
+        }
+    }
+
+    if wants_quickfix {
+        Some(("Fix JSON syntax issues (tvek)", "quickfix", true))
+    } else if wants_fix_all {
+        Some((
+            "Fix all auto-fixable tvek issues",
+            "source.fixAll.tvek",
+            false,
+        ))
+    } else {
+        None
+    }
+}
+
 fn publish_diagnostics_for_doc<W: Write>(
     writer: &mut W,
     uri: &str,
     text: &str,
     config: &LspConfig,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let max_mem = compute_lsp_max_output_bytes(config.max_input_bytes);
     let errs = lint_json_multi_with_options(
         text.as_bytes(),
@@ -596,6 +750,7 @@ fn publish_diagnostics_for_doc<W: Write>(
         max_mem,
         MAX_LINT_DIAGNOSTICS,
     );
+    let has_diagnostics = !errs.is_empty();
     let mut diags: Vec<(usize, usize, usize, String)> = Vec::with_capacity(errs.len());
     let mut pos_cursor = Utf16PositionCursor::new(text);
     for err in errs {
@@ -624,7 +779,8 @@ fn publish_diagnostics_for_doc<W: Write>(
     }
 
     let notif = build_publish_diagnostics_notification_multi(uri, &diags);
-    write_lsp_frame(writer, &notif)
+    write_lsp_frame(writer, &notif)?;
+    Ok(has_diagnostics)
 }
 
 fn build_publish_diagnostics_notification(
@@ -2002,5 +2158,117 @@ mod tests {
                 err.offset
             );
         }
+    }
+
+    #[test]
+    fn test_lsp_code_action_quickfix_and_fix_all() {
+        let mut stream = String::new();
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        ));
+        // 1. Open document with UTF-8 BOM + trailing commas in array and object
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///fix.json","languageId":"json","version":1,"text":"\uFEFF{\"arr\": [1, 2, 3,],}"}}}"#,
+        ));
+        // 2. Request code actions on fixable document (default / unfiltered -> 1 quickfix action)
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///fix.json"},"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":10}},"context":{"diagnostics":[]}}}"#,
+        ));
+        // 3. Request code actions with context.only = ["source.fixAll.tvek"] -> 1 source.fixAll.tvek action
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///fix.json"},"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":10}},"context":{"diagnostics":[],"only":["source.fixAll.tvek"]}}}"#,
+        ));
+        // 4. Request code actions with context.only = ["refactor"] -> [] without running formatter
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":4,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///fix.json"},"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":10}},"context":{"diagnostics":[],"only":["refactor"]}}}"#,
+        ));
+        // 5. Open an already-valid document and verify codeAction returns [] via O(1) has_diagnostics cache
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///valid.json","languageId":"json","version":1,"text":"{\"a\": 1}\n"}}}"#,
+        ));
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///valid.json"},"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}},"context":{"diagnostics":[]}}}"#,
+        ));
+
+        let mut reader = Cursor::new(stream.into_bytes());
+        let mut writer = Vec::new();
+        let _ = run_server_loop(&mut reader, &mut writer, LspConfig::default()).unwrap();
+
+        let frames = read_all_frames(&writer);
+        // Frame 0: initialize
+        // Frame 1: didOpen diag (fix.json)
+        // Frame 2: codeAction default (fix.json -> quickfix)
+        // Frame 3: codeAction only=["source.fixAll.tvek"] (fix.json -> source.fixAll.tvek)
+        // Frame 4: codeAction only=["refactor"] (fix.json -> [])
+        // Frame 5: didOpen diag (valid.json)
+        // Frame 6: codeAction (valid.json -> [])
+        assert_eq!(frames.len(), 7);
+
+        // Verify initialize advertises codeActionProvider
+        let kinds = frames[0]
+            .get_field("result")
+            .and_then(|r| r.get_field("capabilities"))
+            .and_then(|c| c.get_field("codeActionProvider"))
+            .and_then(|cap| cap.get_field("codeActionKinds"))
+            .and_then(|k| k.as_array())
+            .unwrap();
+        assert_eq!(kinds.len(), 3);
+
+        // Verify default codeAction response for fix.json contains a single quickfix action (TVEK-22)
+        let quickfix_actions = frames[2]
+            .get_field("result")
+            .and_then(|r| r.as_array())
+            .unwrap();
+        assert_eq!(quickfix_actions.len(), 1);
+        assert_eq!(
+            quickfix_actions[0]
+                .get_field("kind")
+                .and_then(|v| v.as_str()),
+            Some("quickfix")
+        );
+        assert_eq!(
+            quickfix_actions[0]
+                .get_field("isPreferred")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        let changes = quickfix_actions[0]
+            .get_field("edit")
+            .and_then(|e| e.get_field("changes"))
+            .and_then(|c| c.get_field("file:///fix.json"))
+            .and_then(|arr| arr.as_array())
+            .unwrap();
+        assert_eq!(
+            changes[0].get_field("newText").and_then(|v| v.as_str()),
+            Some("{\n  \"arr\": [1, 2, 3]\n}\n")
+        );
+
+        // Verify context.only = ["source.fixAll.tvek"] returns a single source.fixAll.tvek action
+        let fix_all_actions = frames[3]
+            .get_field("result")
+            .and_then(|r| r.as_array())
+            .unwrap();
+        assert_eq!(fix_all_actions.len(), 1);
+        assert_eq!(
+            fix_all_actions[0]
+                .get_field("kind")
+                .and_then(|v| v.as_str()),
+            Some("source.fixAll.tvek")
+        );
+        assert!(fix_all_actions[0].get_field("isPreferred").is_none());
+
+        // Verify context.only = ["refactor"] returns []
+        let refactor_actions = frames[4]
+            .get_field("result")
+            .and_then(|r| r.as_array())
+            .unwrap();
+        assert!(refactor_actions.is_empty());
+
+        // Verify codeAction response for valid.json is empty
+        let valid_actions = frames[6]
+            .get_field("result")
+            .and_then(|r| r.as_array())
+            .unwrap();
+        assert!(valid_actions.is_empty());
     }
 }

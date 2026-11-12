@@ -102,6 +102,7 @@ pub struct FormatOptions {
     pub sort_keys: bool,
     pub allow_comments: bool,
     pub line_width: usize,
+    pub fix: bool,
 }
 
 impl Default for FormatOptions {
@@ -112,6 +113,7 @@ impl Default for FormatOptions {
             sort_keys: false,
             allow_comments: true,
             line_width: DEFAULT_LINE_WIDTH,
+            fix: false,
         }
     }
 }
@@ -312,6 +314,7 @@ pub fn lint_json_with_options(
         sort_keys: false,
         allow_comments,
         line_width: 0,
+        fix: false,
     };
     let indent_table = IndentTable::new(0, true);
     let mut sink = NullSink;
@@ -392,6 +395,7 @@ pub fn format_json_into_buf(
     let indent_table = IndentTable::new(options.indent, options.minify);
     let mut sink = BoundedVecRefSink::new(out, max_output_bytes);
     let mut scanner = Scanner::new(input, options.allow_comments, max_output_bytes);
+    scanner.fix = options.fix;
 
     if options.sort_keys {
         let mut builder = SortedDomBuilder::new(max_output_bytes);
@@ -1544,6 +1548,7 @@ struct Scanner<'a> {
     input: &'a [u8],
     pos: usize,
     allow_comments: bool,
+    fix: bool,
     max_scratch_bytes: usize,
     last_string_has_escapes: bool,
     defer_line_col: bool,
@@ -1556,6 +1561,7 @@ impl<'a> Scanner<'a> {
             input,
             pos: 0,
             allow_comments,
+            fix: false,
             max_scratch_bytes,
             last_string_has_escapes: false,
             defer_line_col: false,
@@ -1604,7 +1610,7 @@ impl<'a> Scanner<'a> {
                     saw_newline = true;
                 }
                 b'/' => {
-                    if !self.allow_comments {
+                    if !self.allow_comments && !self.fix {
                         return Err(
                             self.err("Comments are not allowed in strict RFC 8259 mode", self.pos)
                         );
@@ -1632,21 +1638,23 @@ impl<'a> Scanner<'a> {
                             ));
                         }
                     };
-                    let next_bytes = out
-                        .len()
-                        .saturating_add(1)
-                        .saturating_mul(size_of::<CommentPiece<'a>>());
-                    if next_bytes > self.max_scratch_bytes {
-                        return Err(self.err(
-                            "Formatted output exceeds maximum allowed buffer size",
-                            comment_pos,
-                        ));
+                    if self.allow_comments {
+                        let next_bytes = out
+                            .len()
+                            .saturating_add(1)
+                            .saturating_mul(size_of::<CommentPiece<'a>>());
+                        if next_bytes > self.max_scratch_bytes {
+                            return Err(self.err(
+                                "Formatted output exceeds maximum allowed buffer size",
+                                comment_pos,
+                            ));
+                        }
+                        out.push(CommentPiece {
+                            raw,
+                            pos: comment_pos,
+                            inline_with_prev,
+                        });
                     }
-                    out.push(CommentPiece {
-                        raw,
-                        pos: comment_pos,
-                        inline_with_prev,
-                    });
                 }
                 _ => break,
             }
@@ -1748,12 +1756,16 @@ impl<'a> Scanner<'a> {
         &mut self,
         events: &mut E,
     ) -> Result<(), SyntaxError> {
-        // ADR-02 / IMP-08: Explicitly reject UTF-8 BOM at offset 0
+        // ADR-02 / IMP-08: Explicitly reject UTF-8 BOM at offset 0 (or strip in --fix mode)
         if self.input.starts_with(b"\xEF\xBB\xBF") {
-            return Err(self.err(
-                "UTF-8 BOM (byte order mark) is not allowed in RFC 8259 JSON",
-                0,
-            ));
+            if self.fix {
+                self.pos = 3;
+            } else {
+                return Err(self.err(
+                    "UTF-8 BOM (byte order mark) is not allowed in RFC 8259 JSON",
+                    0,
+                ));
+            }
         }
 
         let mut trivia_a: Vec<CommentPiece<'a>> = Vec::new();
@@ -1896,6 +1908,29 @@ impl<'a> Scanner<'a> {
                                         return Err(self.err("Unterminated JSON object", self.pos));
                                     }
                                     if self.input[self.pos] == b'}' {
+                                        if self.fix {
+                                            let close_pos = self.pos;
+                                            self.pos += 1;
+                                            if trivia_b.is_empty() {
+                                                events.on_close_object(
+                                                    close_pos,
+                                                    &[],
+                                                    &[],
+                                                    self.input,
+                                                )?;
+                                            } else {
+                                                let (last_trailing, inner_trailing) =
+                                                    split_inline_comments(&trivia_b);
+                                                events.on_close_object(
+                                                    close_pos,
+                                                    last_trailing,
+                                                    inner_trailing,
+                                                    self.input,
+                                                )?;
+                                                trivia_b.clear();
+                                            }
+                                            continue;
+                                        }
                                         return Err(self.err(
                                             "Trailing comma is not allowed in JSON object",
                                             comma_pos,
@@ -1934,6 +1969,27 @@ impl<'a> Scanner<'a> {
                                         return Err(self.err("Unterminated JSON object", self.pos));
                                     }
                                     if self.input[self.pos] == b'}' {
+                                        if self.fix {
+                                            let close_pos = self.pos;
+                                            self.pos += 1;
+                                            let (inline_after, standalone_after) =
+                                                split_inline_comments(&trivia_b);
+                                            combined_inline.extend_from_slice(inline_before);
+                                            combined_inline.extend_from_slice(inline_after);
+                                            combined_leading.extend_from_slice(standalone_before);
+                                            combined_leading.extend_from_slice(standalone_after);
+                                            events.on_close_object(
+                                                close_pos,
+                                                &combined_inline,
+                                                &combined_leading,
+                                                self.input,
+                                            )?;
+                                            trivia_a.clear();
+                                            trivia_b.clear();
+                                            combined_inline.clear();
+                                            combined_leading.clear();
+                                            continue;
+                                        }
                                         return Err(self.err(
                                             "Trailing comma is not allowed in JSON object",
                                             comma_pos,
@@ -2004,6 +2060,29 @@ impl<'a> Scanner<'a> {
                                         return Err(self.err("Unterminated JSON array", self.pos));
                                     }
                                     if self.input[self.pos] == b']' {
+                                        if self.fix {
+                                            let close_pos = self.pos;
+                                            self.pos += 1;
+                                            if trivia_b.is_empty() {
+                                                events.on_close_array(
+                                                    close_pos,
+                                                    &[],
+                                                    &[],
+                                                    self.input,
+                                                )?;
+                                            } else {
+                                                let (last_trailing, inner_trailing) =
+                                                    split_inline_comments(&trivia_b);
+                                                events.on_close_array(
+                                                    close_pos,
+                                                    last_trailing,
+                                                    inner_trailing,
+                                                    self.input,
+                                                )?;
+                                                trivia_b.clear();
+                                            }
+                                            continue;
+                                        }
                                         return Err(self.err(
                                             "Trailing comma is not allowed in JSON array",
                                             comma_pos,
@@ -2032,6 +2111,27 @@ impl<'a> Scanner<'a> {
                                         return Err(self.err("Unterminated JSON array", self.pos));
                                     }
                                     if self.input[self.pos] == b']' {
+                                        if self.fix {
+                                            let close_pos = self.pos;
+                                            self.pos += 1;
+                                            let (inline_after, standalone_after) =
+                                                split_inline_comments(&trivia_b);
+                                            combined_inline.extend_from_slice(inline_before);
+                                            combined_inline.extend_from_slice(inline_after);
+                                            combined_leading.extend_from_slice(standalone_before);
+                                            combined_leading.extend_from_slice(standalone_after);
+                                            events.on_close_array(
+                                                close_pos,
+                                                &combined_inline,
+                                                &combined_leading,
+                                                self.input,
+                                            )?;
+                                            trivia_a.clear();
+                                            trivia_b.clear();
+                                            combined_inline.clear();
+                                            combined_leading.clear();
+                                            continue;
+                                        }
                                         return Err(self.err(
                                             "Trailing comma is not allowed in JSON array",
                                             comma_pos,
@@ -2107,7 +2207,25 @@ impl<'a> Scanner<'a> {
                 b' ' | b'\t' | b'\r' | b'\n' => {
                     self.pos += 1;
                 }
-                b'/' => return false,
+                b'/' => {
+                    if !self.allow_comments && self.fix {
+                        match self.input.get(self.pos + 1).copied() {
+                            Some(b'/') => {
+                                if self.scan_line_comment().is_err() {
+                                    return false;
+                                }
+                            }
+                            Some(b'*') => {
+                                if self.scan_block_comment().is_err() {
+                                    return false;
+                                }
+                            }
+                            _ => return false,
+                        }
+                    } else {
+                        return false;
+                    }
+                }
                 _ => break,
             }
         }
@@ -2162,6 +2280,7 @@ impl<'a> Scanner<'a> {
                 input: &self.input[..window_end],
                 pos: item_start,
                 allow_comments: self.allow_comments,
+                fix: self.fix,
                 max_scratch_bytes: self.max_scratch_bytes,
                 last_string_has_escapes: false,
                 defer_line_col: true,
@@ -2189,6 +2308,17 @@ impl<'a> Scanner<'a> {
                     if !self.skip_ws_no_comments() || self.pos >= self.input.len() {
                         self.pos = saved_pos;
                         return Ok(false);
+                    }
+                    if self.fix && self.input[self.pos] == b']' {
+                        let close_pos = self.pos;
+                        self.pos += 1;
+                        events.on_inline_scalar_array(
+                            open_pos,
+                            inline_items,
+                            close_pos,
+                            self.input,
+                        )?;
+                        return Ok(true);
                     }
                 }
                 b']' => {
@@ -4588,5 +4718,54 @@ mod tests {
             "{\n  \"with_comment\": [1, /* c */ 2],\n  \"matrix\": [[1, 2], [3, 4]]\n}";
         let expected_nested = "{\n  \"with_comment\": [\n    1, /* c */\n    2\n  ],\n  \"matrix\": [\n    [1, 2],\n    [3, 4]\n  ]\n}\n";
         assert_eq!(fmt_default(nested_and_comment).unwrap(), expected_nested);
+    }
+
+    #[test]
+    fn test_fix_trailing_commas_bom_and_strict_comments() {
+        let fix_opts = FormatOptions {
+            fix: true,
+            ..FormatOptions::default()
+        };
+
+        // 1. UTF-8 BOM + trailing commas in object, inline scalar array, and multi-line array
+        let input = b"\xEF\xBB\xBF{\n  \"arr\": [1, 2, 3,],\n  \"nested\": [{\"a\": 1,},],\n}\n";
+        assert!(format_json(input, &FormatOptions::default()).is_err());
+        let fixed = String::from_utf8(format_json(input, &fix_opts).unwrap()).unwrap();
+        let expected =
+            "{\n  \"arr\": [1, 2, 3],\n  \"nested\": [\n    {\n      \"a\": 1\n    }\n  ]\n}\n";
+        assert_eq!(fixed, expected);
+
+        // 2. Trailing commas with comments before and after the comma are preserved cleanly
+        let commented = "{\n  \"a\": 1 /* before */, // after\n  // footer\n}\n";
+        assert!(fmt_default(commented).is_err());
+        let fixed_commented =
+            String::from_utf8(format_json(commented.as_bytes(), &fix_opts).unwrap()).unwrap();
+        let expected_commented = "{\n  \"a\": 1 /* before */ // after\n  // footer\n}\n";
+        assert_eq!(fixed_commented, expected_commented);
+
+        let arr_commented = "[\n  1 /* before */, // after\n  // footer\n]\n";
+        let fixed_arr_commented =
+            String::from_utf8(format_json(arr_commented.as_bytes(), &fix_opts).unwrap()).unwrap();
+        let expected_arr_commented = "[\n  1 /* before */ // after\n  // footer\n]\n";
+        assert_eq!(fixed_arr_commented, expected_arr_commented);
+
+        // 3. --strict --fix strips // and /* */ comments to produce strict RFC 8259 JSON
+        let strict_fix_opts = FormatOptions {
+            allow_comments: false,
+            fix: true,
+            ..FormatOptions::default()
+        };
+        let with_comments =
+            b"\xEF\xBB\xBF// header\n{\n  /* block */ \"k\": [1, /* inline */ 2,], // trailing\n}\n";
+        let fixed_strict =
+            String::from_utf8(format_json(with_comments, &strict_fix_opts).unwrap()).unwrap();
+        assert_eq!(fixed_strict, "{\n  \"k\": [1, 2]\n}\n");
+        assert!(lint_json_strict(fixed_strict.as_bytes(), DEFAULT_MAX_OUTPUT_BYTES).is_ok());
+
+        // 4. Semantic / security errors (duplicate keys, bare CR in block comment) are NEVER masked by --fix
+        let dup_keys = b"{\"a\": 1, \"a\": 2,}";
+        assert!(format_json(dup_keys, &fix_opts).is_err());
+        let bare_cr_comment = b"{\n  /* *\r/ \"admin\": true, /* */\n  \"admin\": false\n}";
+        assert!(format_json(bare_cr_comment, &strict_fix_opts).is_err());
     }
 }

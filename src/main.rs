@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tvek::error::sanitize_for_terminal;
 use tvek::lexer::{
-    format_json_into_buf, lint_json_multi_with_options, FormatOptions, DEFAULT_MAX_INPUT_BYTES,
-    DEFAULT_MAX_OUTPUT_BYTES, MAX_LINE_WIDTH, MAX_LINT_DIAGNOSTICS,
+    format_json_into_buf, lint_json_multi_with_options, lint_json_with_options, FormatOptions,
+    DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_OUTPUT_BYTES, MAX_LINE_WIDTH, MAX_LINT_DIAGNOSTICS,
 };
 use tvek::lsp::{run_stdio_server, LspConfig};
 
@@ -46,6 +46,7 @@ OPTIONS:
     -c, --check              Lint and verify formatting without modifying files
     -l, --lint               Lint syntax only (ignore whitespace/indentation differences)
     -w, --write              Format files in-place atomically when output differs
+    -f, --fix                Automatically fix safe syntax/lint issues (trailing commas, UTF-8 BOM, strict comments)
     -m, --minify             Output compact single-line JSON with whitespace and comments stripped
     -i, --indent <N>         Number of spaces per indentation level (default: 2; 0 for tab)
     -s, --sort-keys          Lexicographically sort object keys at every nesting level
@@ -173,6 +174,7 @@ where
                 "check" => cfg.check = true,
                 "lint" => cfg.lint = true,
                 "write" => cfg.write = true,
+                "fix" => cfg.format_opts.fix = true,
                 "minify" => cfg.format_opts.minify = true,
                 "sort-keys" => cfg.format_opts.sort_keys = true,
                 "structural" | "expand" => {
@@ -223,6 +225,7 @@ where
                     'c' => cfg.check = true,
                     'l' => cfg.lint = true,
                     'w' => cfg.write = true,
+                    'f' => cfg.format_opts.fix = true,
                     'm' => cfg.format_opts.minify = true,
                     's' => cfg.format_opts.sort_keys = true,
                     'q' => cfg.quiet = true,
@@ -262,9 +265,10 @@ where
     }
 
     if lsp_mode {
-        if cfg.check || cfg.lint || cfg.write || cfg.quiet || explicit_indent {
+        if cfg.check || cfg.lint || cfg.write || cfg.quiet || explicit_indent || cfg.format_opts.fix
+        {
             return Err(
-                "Options '--check', '--lint', '--write', '--quiet', and '--indent' cannot be used with 'tvek server' / '--lsp'"
+                "Options '--check', '--lint', '--write', '--fix', '--quiet', and '--indent' cannot be used with 'tvek server' / '--lsp'"
                     .to_string(),
             );
         }
@@ -283,6 +287,10 @@ where
         }));
     }
 
+    if cfg.check && cfg.format_opts.fix {
+        return Err("Options '--check' and '--fix' cannot be used together".to_string());
+    }
+
     // ADR-01 / IMP-02: Validate mutually exclusive CLI flags and disallow --write with stdin
     let mode_count = (cfg.check as u8) + (cfg.lint as u8) + (cfg.write as u8);
     if mode_count > 1 {
@@ -294,6 +302,23 @@ where
         && (cfg.targets.is_empty() || cfg.targets.iter().any(|t| matches!(t, InputTarget::Stdin)))
     {
         return Err("Option '--write' cannot be used with stdin ('-')".to_string());
+    }
+    if cfg.lint
+        && cfg.format_opts.fix
+        && (cfg.targets.is_empty() || cfg.targets.iter().any(|t| matches!(t, InputTarget::Stdin)))
+    {
+        return Err("Option '--lint --fix' cannot be used with stdin ('-')".to_string());
+    }
+
+    // When --fix is passed with file/directory targets (and neither --check nor --lint is set),
+    // imply --write so files are repaired and formatted in-place atomically.
+    if cfg.format_opts.fix
+        && !cfg.check
+        && !cfg.lint
+        && !cfg.targets.is_empty()
+        && !cfg.targets.iter().any(|t| matches!(t, InputTarget::Stdin))
+    {
+        cfg.write = true;
     }
 
     Ok(ParseAction::Run(cfg))
@@ -778,6 +803,37 @@ fn process_buffer_with_output(
     let max_output_bytes = compute_max_output_bytes(cfg.max_input_bytes);
 
     if cfg.lint {
+        if cfg.format_opts.fix {
+            if lint_json_with_options(input, cfg.format_opts.allow_comments, max_output_bytes)
+                .is_ok()
+            {
+                return;
+            }
+            if format_json_into_buf(input, &cfg.format_opts, max_output_bytes, formatted).is_ok() {
+                if let Some(path) = file_path {
+                    if let Err(e) = validate_writable_target(path) {
+                        write_stderr_line(&format!(
+                            "error: Failed to write '{}': {}",
+                            safe_display, e
+                        ));
+                        has_io_err.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    if formatted.as_slice() != input {
+                        if let Err(e) = write_file_atomically(path, formatted) {
+                            write_stderr_line(&format!(
+                                "error: Failed to write '{}': {}",
+                                safe_display, e
+                            ));
+                            has_io_err.store(true, Ordering::Relaxed);
+                        } else if !cfg.quiet {
+                            write_stderr_line(&format!("Fixed {}", safe_display));
+                        }
+                    }
+                }
+                return;
+            }
+        }
         let errs = lint_json_multi_with_options(
             input,
             cfg.format_opts.allow_comments,
@@ -1386,6 +1442,7 @@ mod tests {
                 sort_keys: true,
                 allow_comments: true,
                 line_width: DEFAULT_LINE_WIDTH,
+                fix: false,
             },
             targets: Vec::new(),
         };
@@ -1471,6 +1528,7 @@ mod tests {
                 sort_keys: true,
                 allow_comments: true,
                 line_width: DEFAULT_LINE_WIDTH,
+                fix: false,
             },
             targets: Vec::new(),
         };
@@ -1705,5 +1763,99 @@ mod tests {
         assert!(buffers.input.capacity() >= SHRINK_TARGET_CAPACITY);
         assert!(buffers.output.capacity() <= MAX_RETAINED_WORKER_BUF_CAPACITY);
         assert!(buffers.output.capacity() >= SHRINK_TARGET_CAPACITY);
+    }
+
+    #[test]
+    fn test_cli_fix_flag_in_place_and_lint_fix() {
+        // 1. Flag validation: --check and --fix cannot be used together
+        assert!(parse_args(vec!["--check", "--fix", "a.json"]).is_err());
+        assert!(parse_args(vec!["-cf", "a.json"]).is_err());
+        assert!(parse_args(vec!["server", "--fix"]).is_err());
+
+        // 2. --fix with file targets implies write: true; --fix with stdin keeps write: false
+        let act_file = parse_args(vec!["--fix", "a.json"]).unwrap();
+        match act_file {
+            ParseAction::Run(cfg) => {
+                assert!(cfg.format_opts.fix);
+                assert!(cfg.write);
+            }
+            _ => panic!("Expected Run"),
+        }
+        let act_stdin = parse_args(vec!["-f"]).unwrap();
+        match act_stdin {
+            ParseAction::Run(cfg) => {
+                assert!(cfg.format_opts.fix);
+                assert!(!cfg.write);
+            }
+            _ => panic!("Expected Run"),
+        }
+
+        // 3. tvek --fix file.json repairs trailing comma + BOM and formats in-place
+        let dir = create_temp_test_dir("cli_fix");
+        let fix_target = dir.join("broken.json");
+        fs::write(&fix_target, b"\xEF\xBB\xBF{\"arr\":[1,2,3,],}").unwrap();
+
+        let cfg_fix = CliConfig {
+            write: true,
+            quiet: true,
+            format_opts: FormatOptions {
+                fix: true,
+                ..FormatOptions::default()
+            },
+            ..CliConfig::default()
+        };
+        let lint_err = AtomicBool::new(false);
+        let io_err = AtomicBool::new(false);
+        process_file_batch(
+            std::slice::from_ref(&fix_target),
+            &cfg_fix,
+            &lint_err,
+            &io_err,
+        );
+        assert!(!lint_err.load(Ordering::Relaxed));
+        assert!(!io_err.load(Ordering::Relaxed));
+        assert_eq!(
+            String::from_utf8(fs::read(&fix_target).unwrap()).unwrap(),
+            "{\n  \"arr\": [1, 2, 3]\n}\n"
+        );
+
+        // 4. tvek --lint --fix leaves already-valid unformatted files untouched while repairing broken files
+        let valid_unformatted = dir.join("valid_unformatted.json");
+        fs::write(&valid_unformatted, b"{\"a\":1,\"b\":2}").unwrap();
+        let broken_lint = dir.join("broken_lint.json");
+        fs::write(&broken_lint, b"{\"a\": 1,}").unwrap();
+
+        let cfg_lint_fix = CliConfig {
+            lint: true,
+            quiet: true,
+            format_opts: FormatOptions {
+                fix: true,
+                ..FormatOptions::default()
+            },
+            ..CliConfig::default()
+        };
+        process_file_batch(
+            &[valid_unformatted.clone(), broken_lint.clone()],
+            &cfg_lint_fix,
+            &lint_err,
+            &io_err,
+        );
+        assert!(!lint_err.load(Ordering::Relaxed));
+        assert!(!io_err.load(Ordering::Relaxed));
+        assert_eq!(
+            String::from_utf8(fs::read(&valid_unformatted).unwrap()).unwrap(),
+            "{\"a\":1,\"b\":2}",
+            "--lint --fix must not reformat already-valid files"
+        );
+        assert_eq!(
+            String::from_utf8(fs::read(&broken_lint).unwrap()).unwrap(),
+            "{\n  \"a\": 1\n}\n"
+        );
+
+        // 5. INFO-02: --lint --fix with stdin is rejected in parse_args
+        assert!(parse_args(vec![OsString::from("--lint"), OsString::from("--fix")]).is_err());
+        assert!(parse_args(vec![OsString::from("-lf"), OsString::from("-")]).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
