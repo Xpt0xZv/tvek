@@ -4,8 +4,8 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use crate::error::sanitize_for_terminal;
 use crate::lexer::{
     format_json_with_limit, is_ident_continue, lint_json_multi_with_options, skip_ascii_spaces,
-    skip_plain_ascii_string_bytes, FormatOptions, DEFAULT_MAX_INPUT_BYTES,
-    DEFAULT_MAX_OUTPUT_BYTES, MAX_LINT_DIAGNOSTICS,
+    skip_plain_ascii_string_bytes, FormatOptions, DEFAULT_LINE_WIDTH, DEFAULT_MAX_INPUT_BYTES,
+    DEFAULT_MAX_OUTPUT_BYTES, MAX_LINE_WIDTH, MAX_LINT_DIAGNOSTICS,
 };
 
 const MAX_HEADER_LINE_BYTES: usize = 4096;
@@ -22,6 +22,7 @@ pub struct LspConfig {
     pub sort_keys: bool,
     pub minify: bool,
     pub allow_comments: bool,
+    pub line_width: usize,
     pub max_input_bytes: usize,
 }
 
@@ -31,6 +32,7 @@ impl Default for LspConfig {
             sort_keys: false,
             minify: false,
             allow_comments: true,
+            line_width: DEFAULT_LINE_WIDTH,
             max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
         }
     }
@@ -246,6 +248,7 @@ pub fn run_server_loop<R: BufRead, W: Write>(
                     indent,
                     sort_keys: config.sort_keys,
                     allow_comments: config.allow_comments,
+                    line_width: config.line_width,
                 };
 
                 let max_out = compute_lsp_max_output_bytes(config.max_input_bytes);
@@ -534,6 +537,20 @@ fn apply_initialization_options(
     }
     if let Some(strict) = init_opts.get_field("strict").and_then(|v| v.as_bool()) {
         config.allow_comments = !strict;
+    }
+    if let Some(structural) = init_opts.get_field("structural").and_then(|v| v.as_bool()) {
+        if structural {
+            config.line_width = 0;
+        } else if config.line_width == 0 {
+            config.line_width = DEFAULT_LINE_WIDTH;
+        }
+    }
+    if let Some(line_width) = init_opts
+        .get_field("lineWidth")
+        .or_else(|| init_opts.get_field("line_width"))
+        .and_then(|v| v.as_usize())
+    {
+        config.line_width = line_width.min(MAX_LINE_WIDTH);
     }
     if let Some(max_size) = init_opts
         .get_field("maxSize")
@@ -1691,10 +1708,8 @@ mod tests {
     fn test_tvek_10_clamp_init_max_size_and_incremental_frame_read() {
         // Host starts server with max_input_bytes = 1024. Client tries to escalate maxSize to 999_999_999.
         let mut cfg = LspConfig {
-            sort_keys: false,
-            minify: false,
-            allow_comments: true,
             max_input_bytes: 1024,
+            ..LspConfig::default()
         };
         let opts = parse_rpc_value(br#"{"maxSize": 999999999}"#).unwrap();
         apply_initialization_options(&mut cfg, &opts, 1024);
@@ -1723,10 +1738,8 @@ mod tests {
 
         // 2. When didChange exceeds max_input_bytes, stale cached document must be evicted
         let small_cfg = LspConfig {
-            sort_keys: false,
-            minify: false,
-            allow_comments: true,
             max_input_bytes: 32,
+            ..LspConfig::default()
         };
         let mut stream = String::new();
         stream.push_str(&frame_msg(
@@ -1927,10 +1940,8 @@ mod tests {
 
         // Verify tvek server publishes all 3 diagnostics in a single publishDiagnostics notification
         let strict_cfg = LspConfig {
-            sort_keys: false,
-            minify: false,
             allow_comments: false,
-            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+            ..LspConfig::default()
         };
         let mut stream = String::new();
         stream.push_str(&frame_msg(
