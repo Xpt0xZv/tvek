@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tvek::error::sanitize_for_terminal;
 use tvek::lexer::{
     format_json_into_buf, lint_json_multi_with_options, FormatOptions, DEFAULT_MAX_INPUT_BYTES,
-    DEFAULT_MAX_OUTPUT_BYTES, MAX_LINT_DIAGNOSTICS,
+    DEFAULT_MAX_OUTPUT_BYTES, MAX_LINE_WIDTH, MAX_LINT_DIAGNOSTICS,
 };
 use tvek::lsp::{run_stdio_server, LspConfig};
 
@@ -49,6 +49,8 @@ OPTIONS:
     -m, --minify             Output compact single-line JSON with whitespace and comments stripped
     -i, --indent <N>         Number of spaces per indentation level (default: 2; 0 for tab)
     -s, --sort-keys          Lexicographically sort object keys at every nesting level
+        --structural         Format arrays with one element per line (equivalent to --line-width 0)
+        --line-width <N>     Maximum line width for inline scalar arrays (default: 80; 0 for structural)
         --strict             Enforce strict RFC 8259 JSON (disallow '//' and '/* */' comments)
         --max-size <BYTES>   Maximum input size in bytes (default: 104857600 / 100 MiB)
         --lsp                Start the Language Server Protocol (LSP) server over stdio
@@ -111,6 +113,7 @@ where
     let mut cfg = CliConfig::default();
     let mut positional_only = false;
     let mut explicit_indent = false;
+    let mut explicit_line_width = false;
     let mut lsp_mode = false;
 
     while let Some(os_arg) = iter.next() {
@@ -156,6 +159,10 @@ where
                         cfg.format_opts.indent = parse_indent_value(val)?;
                         explicit_indent = true;
                     }
+                    "line-width" => {
+                        cfg.format_opts.line_width = parse_line_width_value(val)?;
+                        explicit_line_width = true;
+                    }
                     "max-size" => cfg.max_input_bytes = parse_max_size_value(val)?,
                     _ => return Err(format!("Unknown option '--{}'", key)),
                 }
@@ -168,6 +175,10 @@ where
                 "write" => cfg.write = true,
                 "minify" => cfg.format_opts.minify = true,
                 "sort-keys" => cfg.format_opts.sort_keys = true,
+                "structural" | "expand" => {
+                    cfg.format_opts.line_width = 0;
+                    explicit_line_width = true;
+                }
                 "strict" | "no-comments" => cfg.format_opts.allow_comments = false,
                 "quiet" => cfg.quiet = true,
                 "lsp" => lsp_mode = true,
@@ -182,6 +193,16 @@ where
                         .ok_or_else(|| "Invalid non-UTF-8 value for '--indent'".to_string())?;
                     cfg.format_opts.indent = parse_indent_value(val)?;
                     explicit_indent = true;
+                }
+                "line-width" => {
+                    let val_os = iter.next().ok_or_else(|| {
+                        "Option '--line-width' requires a numeric value <N>".to_string()
+                    })?;
+                    let val = val_os
+                        .to_str()
+                        .ok_or_else(|| "Invalid non-UTF-8 value for '--line-width'".to_string())?;
+                    cfg.format_opts.line_width = parse_line_width_value(val)?;
+                    explicit_line_width = true;
                 }
                 "max-size" => {
                     let val_os = iter.next().ok_or_else(|| {
@@ -230,6 +251,16 @@ where
         }
     }
 
+    if cfg.format_opts.minify && explicit_indent {
+        return Err("Options '--minify' and '--indent' cannot be used together".to_string());
+    }
+    if cfg.format_opts.minify && explicit_line_width {
+        return Err(
+            "Options '--minify' and '--structural' / '--line-width' cannot be used together"
+                .to_string(),
+        );
+    }
+
     if lsp_mode {
         if cfg.check || cfg.lint || cfg.write || cfg.quiet || explicit_indent {
             return Err(
@@ -247,6 +278,7 @@ where
             sort_keys: cfg.format_opts.sort_keys,
             minify: cfg.format_opts.minify,
             allow_comments: cfg.format_opts.allow_comments,
+            line_width: cfg.format_opts.line_width,
             max_input_bytes: cfg.max_input_bytes,
         }));
     }
@@ -257,9 +289,6 @@ where
         return Err(
             "Options '--check', '--lint', and '--write' are mutually exclusive".to_string(),
         );
-    }
-    if cfg.format_opts.minify && explicit_indent {
-        return Err("Options '--minify' and '--indent' cannot be used together".to_string());
     }
     if cfg.write
         && (cfg.targets.is_empty() || cfg.targets.iter().any(|t| matches!(t, InputTarget::Stdin)))
@@ -287,6 +316,22 @@ fn parse_indent_value(val: &str) -> Result<usize, String> {
     })?;
     if n > 64 {
         return Err(format!("Indent value '{}' is too large (maximum is 64)", n));
+    }
+    Ok(n)
+}
+
+fn parse_line_width_value(val: &str) -> Result<usize, String> {
+    let n = val.parse::<usize>().map_err(|_| {
+        format!(
+            "Invalid line-width value '{}': expected non-negative integer",
+            val
+        )
+    })?;
+    if n > MAX_LINE_WIDTH {
+        return Err(format!(
+            "Line width '{}' is too large (maximum is {})",
+            n, MAX_LINE_WIDTH
+        ));
     }
     Ok(n)
 }
@@ -1160,6 +1205,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tvek::lexer::DEFAULT_LINE_WIDTH;
 
     fn create_temp_test_dir(label: &str) -> PathBuf {
         let token = next_random_token(0);
@@ -1339,6 +1385,7 @@ mod tests {
                 indent: 2,
                 sort_keys: true,
                 allow_comments: true,
+                line_width: DEFAULT_LINE_WIDTH,
             },
             targets: Vec::new(),
         };
@@ -1423,6 +1470,7 @@ mod tests {
                 indent: 2,
                 sort_keys: true,
                 allow_comments: true,
+                line_width: DEFAULT_LINE_WIDTH,
             },
             targets: Vec::new(),
         };
@@ -1503,11 +1551,44 @@ mod tests {
                 sort_keys: true,
                 minify: true,
                 allow_comments: false,
+                line_width: DEFAULT_LINE_WIDTH,
                 max_input_bytes: 65536,
             })
         );
+        assert_eq!(
+            parse_args(vec!["server", "--structural"]).unwrap(),
+            ParseAction::Server(LspConfig {
+                line_width: 0,
+                ..LspConfig::default()
+            })
+        );
+        assert_eq!(
+            parse_args(vec!["--structural", "a.json"]).unwrap(),
+            ParseAction::Run(CliConfig {
+                format_opts: FormatOptions {
+                    line_width: 0,
+                    ..FormatOptions::default()
+                },
+                targets: vec![InputTarget::Path(PathBuf::from("a.json"))],
+                ..CliConfig::default()
+            })
+        );
+        assert_eq!(
+            parse_args(vec!["--line-width=100", "a.json"]).unwrap(),
+            ParseAction::Run(CliConfig {
+                format_opts: FormatOptions {
+                    line_width: 100,
+                    ..FormatOptions::default()
+                },
+                targets: vec![InputTarget::Path(PathBuf::from("a.json"))],
+                ..CliConfig::default()
+            })
+        );
 
-        // Invalid flag combinations with server mode must fail with usage error
+        // Invalid flag combinations with --minify or server mode must fail with usage error
+        assert!(parse_args(vec!["--minify", "--structural", "a.json"]).is_err());
+        assert!(parse_args(vec!["--minify", "--line-width=100", "a.json"]).is_err());
+        assert!(parse_args(vec!["--line-width=4097", "a.json"]).is_err());
         assert!(parse_args(vec!["server", "--write"]).is_err());
         assert!(parse_args(vec!["server", "--check"]).is_err());
         assert!(parse_args(vec!["server", "--lint"]).is_err());

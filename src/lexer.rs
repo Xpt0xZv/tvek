@@ -7,6 +7,8 @@ use crate::error::SyntaxError;
 
 pub const MAX_DEPTH: usize = 512;
 pub const MAX_LINT_DIAGNOSTICS: usize = 50;
+pub const DEFAULT_LINE_WIDTH: usize = 80;
+pub const MAX_LINE_WIDTH: usize = 4096;
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 const MAX_INITIAL_CAPACITY: usize = 16 * 1024 * 1024; // 16 MiB cap on initial Vec reservation
@@ -99,6 +101,7 @@ pub struct FormatOptions {
     pub indent: usize,
     pub sort_keys: bool,
     pub allow_comments: bool,
+    pub line_width: usize,
 }
 
 impl Default for FormatOptions {
@@ -108,6 +111,7 @@ impl Default for FormatOptions {
             indent: 2,
             sort_keys: false,
             allow_comments: true,
+            line_width: DEFAULT_LINE_WIDTH,
         }
     }
 }
@@ -307,6 +311,7 @@ pub fn lint_json_with_options(
         indent: 0,
         sort_keys: false,
         allow_comments,
+        line_width: 0,
     };
     let indent_table = IndentTable::new(0, true);
     let mut sink = NullSink;
@@ -610,6 +615,22 @@ trait ParseEvents<'a> {
         input: &'a [u8],
     ) -> Result<(), SyntaxError>;
 
+    #[inline(always)]
+    fn inline_array_budget(&self) -> Option<usize> {
+        None
+    }
+
+    #[inline(always)]
+    fn on_inline_scalar_array(
+        &mut self,
+        _open_pos: usize,
+        _items: &[&'a [u8]],
+        _close_pos: usize,
+        _input: &'a [u8],
+    ) -> Result<(), SyntaxError> {
+        Ok(())
+    }
+
     fn on_primitive(
         &mut self,
         slice: &'a [u8],
@@ -633,6 +654,8 @@ enum StreamFrame<'a> {
 struct StreamEmitter<'a, 'b, S: OutputSink> {
     out: &'b mut S,
     minify: bool,
+    line_width: usize,
+    last_key_len: usize,
     indent_table: &'b IndentTable,
     stack: Vec<StreamFrame<'a>>,
     free_sets: Vec<KeySet<'a>>,
@@ -650,6 +673,8 @@ impl<'a, 'b, S: OutputSink> StreamEmitter<'a, 'b, S> {
         Self {
             out,
             minify: options.minify,
+            line_width: options.line_width.min(MAX_LINE_WIDTH),
+            last_key_len: 0,
             indent_table,
             stack: Vec::with_capacity(32),
             free_sets: Vec::with_capacity(MAX_FREE_KEY_SETS),
@@ -690,6 +715,7 @@ impl<'a, 'b, S: OutputSink> StreamEmitter<'a, 'b, S> {
                 .push_byte(b' ')
                 .map_err(|msg| SyntaxError::new(msg, key.colon_pos, input))?;
         }
+        self.last_key_len = key.slice.len().saturating_add(2);
         Ok(())
     }
 
@@ -775,6 +801,7 @@ impl<'a, 'b, S: OutputSink> ParseEvents<'a> for StreamEmitter<'a, 'b, S> {
         comments: &[CommentPiece<'a>],
         input: &'a [u8],
     ) -> Result<(), SyntaxError> {
+        self.last_key_len = 0;
         let depth = self.stack.len();
         self.out
             .push_byte(b'{')
@@ -873,6 +900,7 @@ impl<'a, 'b, S: OutputSink> ParseEvents<'a> for StreamEmitter<'a, 'b, S> {
         inner_trailing: &[CommentPiece<'a>],
         input: &'a [u8],
     ) -> Result<(), SyntaxError> {
+        self.last_key_len = 0;
         let inner_depth = self.stack.len();
         self.emit_inline_comments(last_trailing, input)?;
         self.emit_standalone_comments(inner_trailing, inner_depth, input)?;
@@ -904,6 +932,7 @@ impl<'a, 'b, S: OutputSink> ParseEvents<'a> for StreamEmitter<'a, 'b, S> {
         comments: &[CommentPiece<'a>],
         input: &'a [u8],
     ) -> Result<(), SyntaxError> {
+        self.last_key_len = 0;
         let depth = self.stack.len();
         self.out
             .push_byte(b'[')
@@ -930,6 +959,7 @@ impl<'a, 'b, S: OutputSink> ParseEvents<'a> for StreamEmitter<'a, 'b, S> {
         first_leading: &[CommentPiece<'a>],
         input: &'a [u8],
     ) -> Result<(), SyntaxError> {
+        self.last_key_len = 0;
         let new_depth = self.stack.len() + 1;
         self.out
             .push_byte(b'[')
@@ -957,6 +987,7 @@ impl<'a, 'b, S: OutputSink> ParseEvents<'a> for StreamEmitter<'a, 'b, S> {
         next_pos: usize,
         input: &'a [u8],
     ) -> Result<(), SyntaxError> {
+        self.last_key_len = 0;
         let depth = self.stack.len();
         self.out
             .push_byte(b',')
@@ -982,6 +1013,7 @@ impl<'a, 'b, S: OutputSink> ParseEvents<'a> for StreamEmitter<'a, 'b, S> {
         inner_trailing: &[CommentPiece<'a>],
         input: &'a [u8],
     ) -> Result<(), SyntaxError> {
+        self.last_key_len = 0;
         let inner_depth = self.stack.len();
         self.emit_inline_comments(last_trailing, input)?;
         self.emit_standalone_comments(inner_trailing, inner_depth, input)?;
@@ -1000,12 +1032,60 @@ impl<'a, 'b, S: OutputSink> ParseEvents<'a> for StreamEmitter<'a, 'b, S> {
     }
 
     #[inline(always)]
+    fn inline_array_budget(&self) -> Option<usize> {
+        if self.minify || self.line_width == 0 {
+            return None;
+        }
+        let prefix_cols = self
+            .stack
+            .len()
+            .saturating_mul(self.indent_table.unit_len)
+            .saturating_add(self.last_key_len);
+        let budget = self
+            .line_width
+            .saturating_sub(prefix_cols.saturating_add(1));
+        if budget >= 3 {
+            Some(budget)
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn on_inline_scalar_array(
+        &mut self,
+        open_pos: usize,
+        items: &[&'a [u8]],
+        close_pos: usize,
+        input: &'a [u8],
+    ) -> Result<(), SyntaxError> {
+        self.last_key_len = 0;
+        self.out
+            .push_byte(b'[')
+            .map_err(|msg| SyntaxError::new(msg, open_pos, input))?;
+        for (idx, item) in items.iter().enumerate() {
+            if idx > 0 {
+                self.out
+                    .extend_slice(b", ")
+                    .map_err(|msg| SyntaxError::new(msg, open_pos, input))?;
+            }
+            self.out
+                .extend_slice(item)
+                .map_err(|msg| SyntaxError::new(msg, open_pos, input))?;
+        }
+        self.out
+            .push_byte(b']')
+            .map_err(|msg| SyntaxError::new(msg, close_pos, input))
+    }
+
+    #[inline(always)]
     fn on_primitive(
         &mut self,
         slice: &'a [u8],
         pos: usize,
         input: &'a [u8],
     ) -> Result<(), SyntaxError> {
+        self.last_key_len = 0;
         self.out
             .extend_slice(slice)
             .map_err(|msg| SyntaxError::new(msg, pos, input))
@@ -1680,6 +1760,7 @@ impl<'a> Scanner<'a> {
         let mut trivia_b: Vec<CommentPiece<'a>> = Vec::new();
         let mut combined_inline: Vec<CommentPiece<'a>> = Vec::new();
         let mut combined_leading: Vec<CommentPiece<'a>> = Vec::new();
+        let mut inline_items: Vec<&'a [u8]> = Vec::new();
 
         self.scan_trivia(false, &mut trivia_a)?;
         if self.pos >= self.input.len() {
@@ -1773,6 +1854,16 @@ impl<'a> Scanner<'a> {
                     }
 
                     if trivia_a.is_empty() {
+                        if let Some(budget) = events.inline_array_budget() {
+                            if self.try_emit_inline_scalar_array(
+                                open_pos,
+                                budget,
+                                &mut inline_items,
+                                events,
+                            )? {
+                                break; // Completed inline scalar `[a, b, c]` value
+                            }
+                        }
                         events.on_open_array(open_pos, &[], &[], self.input)?;
                     } else {
                         let (open_comments, first_leading) = split_inline_comments(&trivia_a);
@@ -2003,6 +2094,115 @@ impl<'a> Scanner<'a> {
         }
 
         events.on_finish(&trivia_a, self.pos, self.input)
+    }
+
+    #[inline(always)]
+    fn skip_ws_no_comments(&mut self) -> bool {
+        while self.pos < self.input.len() {
+            self.pos += skip_ascii_spaces(&self.input[self.pos..]);
+            if self.pos >= self.input.len() {
+                break;
+            }
+            match self.input[self.pos] {
+                b' ' | b'\t' | b'\r' | b'\n' => {
+                    self.pos += 1;
+                }
+                b'/' => return false,
+                _ => break,
+            }
+        }
+        true
+    }
+
+    /// Bounded $O(1)$ scalar-only lookahead probe for width-aware inline array formatting.
+    /// Immediately bails out and restores `self.pos` on any nested `{`/`[`, `/` comment,
+    /// syntax error, or element that pushes the inline length past `budget`.
+    fn try_emit_inline_scalar_array<E: ParseEvents<'a>>(
+        &mut self,
+        open_pos: usize,
+        budget: usize,
+        inline_items: &mut Vec<&'a [u8]>,
+        events: &mut E,
+    ) -> Result<bool, SyntaxError> {
+        let budget = budget.min(MAX_LINE_WIDTH);
+        if budget < 3 {
+            return Ok(false);
+        }
+
+        let saved_pos = self.pos;
+        inline_items.clear();
+        let mut inline_len = 2usize; // '[' and ']'
+
+        loop {
+            if self.pos >= self.input.len() {
+                self.pos = saved_pos;
+                return Ok(false);
+            }
+
+            let b = self.input[self.pos];
+            if b == b'{' || b == b'[' || b == b']' || b == b'/' {
+                self.pos = saved_pos;
+                return Ok(false);
+            }
+
+            let sep_len = if inline_items.is_empty() { 0 } else { 2 }; // ", "
+            if inline_len.saturating_add(sep_len) >= budget {
+                self.pos = saved_pos;
+                return Ok(false);
+            }
+            inline_len += sep_len;
+            let rem_budget = budget - inline_len;
+
+            let item_start = self.pos;
+            let window_end = item_start
+                .saturating_add(rem_budget)
+                .saturating_add(1)
+                .min(self.input.len());
+            let mut sub = Scanner {
+                input: &self.input[..window_end],
+                pos: item_start,
+                allow_comments: self.allow_comments,
+                max_scratch_bytes: self.max_scratch_bytes,
+                last_string_has_escapes: false,
+                defer_line_col: true,
+            };
+            let Ok(slice) = sub.scan_primitive() else {
+                self.pos = saved_pos;
+                return Ok(false);
+            };
+            if slice.len() > rem_budget {
+                self.pos = saved_pos;
+                return Ok(false);
+            }
+            self.pos = sub.pos;
+            inline_len += slice.len();
+            inline_items.push(slice);
+
+            if !self.skip_ws_no_comments() || self.pos >= self.input.len() {
+                self.pos = saved_pos;
+                return Ok(false);
+            }
+
+            match self.input[self.pos] {
+                b',' => {
+                    self.pos += 1;
+                    if !self.skip_ws_no_comments() || self.pos >= self.input.len() {
+                        self.pos = saved_pos;
+                        return Ok(false);
+                    }
+                }
+                b']' => {
+                    let close_pos = self.pos;
+                    self.pos += 1;
+                    events.on_inline_scalar_array(open_pos, inline_items, close_pos, self.input)?;
+                    return Ok(true);
+                }
+                _ => {
+                    self.pos = saved_pos;
+                    return Ok(false);
+                }
+            }
+        }
     }
 
     #[inline(always)]
@@ -2621,28 +2821,93 @@ fn emit_sorted_value_iterative<'b, 'a, S: OutputSink>(
                     }
                     out.push_byte(b']')?;
                 } else {
-                    out.push_byte(b'[')?;
-                    let child_depth = stack.len() + 1;
-                    emit_sorted_inline_comments(out, open_comments, minify)?;
-                    let first = &items[0];
-                    emit_sorted_standalone_comments(
-                        out,
-                        &first.leading_comments,
-                        indent_table,
-                        child_depth,
-                        minify,
-                    )?;
-                    if !minify {
-                        out.push_byte(b'\n')?;
-                        out.push_indent(indent_table, child_depth)?;
+                    let line_width = options.line_width.min(MAX_LINE_WIDTH);
+                    let can_inline = if !minify
+                        && line_width > 0
+                        && open_comments.is_empty()
+                        && inner_trailing_comments.is_empty()
+                    {
+                        let key_cols = match stack.last() {
+                            Some(EmitFrame::Object { entries, index, .. }) => {
+                                entries[*index].raw_key.len().saturating_add(2)
+                            }
+                            _ => 0,
+                        };
+                        let prefix_cols = stack
+                            .len()
+                            .saturating_mul(indent_table.unit_len)
+                            .saturating_add(key_cols);
+                        let budget = line_width.saturating_sub(prefix_cols.saturating_add(1));
+                        if budget >= 3 {
+                            let mut inline_len = 2usize; // '[' and ']'
+                            let mut ok = true;
+                            for (idx, item) in items.iter().enumerate() {
+                                if !item.leading_comments.is_empty()
+                                    || !item.trailing_comments.is_empty()
+                                {
+                                    ok = false;
+                                    break;
+                                }
+                                match item.value {
+                                    SortedValue::Raw(slice) => {
+                                        let sep = if idx == 0 { 0 } else { 2 };
+                                        inline_len = inline_len
+                                            .saturating_add(sep)
+                                            .saturating_add(slice.len());
+                                        if inline_len > budget {
+                                            ok = false;
+                                            break;
+                                        }
+                                    }
+                                    _ => {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            ok
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if can_inline {
+                        out.push_byte(b'[')?;
+                        for (idx, item) in items.iter().enumerate() {
+                            if idx > 0 {
+                                out.extend_slice(b", ")?;
+                            }
+                            if let SortedValue::Raw(slice) = item.value {
+                                out.extend_slice(slice)?;
+                            }
+                        }
+                        out.push_byte(b']')?;
+                    } else {
+                        out.push_byte(b'[')?;
+                        let child_depth = stack.len() + 1;
+                        emit_sorted_inline_comments(out, open_comments, minify)?;
+                        let first = &items[0];
+                        emit_sorted_standalone_comments(
+                            out,
+                            &first.leading_comments,
+                            indent_table,
+                            child_depth,
+                            minify,
+                        )?;
+                        if !minify {
+                            out.push_byte(b'\n')?;
+                            out.push_indent(indent_table, child_depth)?;
+                        }
+                        stack.push(EmitFrame::Array {
+                            items,
+                            inner_trailing: inner_trailing_comments,
+                            index: 0,
+                        });
+                        current = &first.value;
+                        continue 'descend;
                     }
-                    stack.push(EmitFrame::Array {
-                        items,
-                        inner_trailing: inner_trailing_comments,
-                        index: 0,
-                    });
-                    current = &first.value;
-                    continue 'descend;
                 }
             }
             SortedValue::Object {
@@ -3613,7 +3878,26 @@ mod tests {
     #[test]
     fn test_valid_complex_json_formatting() {
         let input = r#"{"name":"tvek","version":1,"active":true,"nothing":null,"items":[1,-2.5,3e10,4.5e-2],"nested":{"empty_obj":{},"empty_arr":[]}}"#;
-        let expected = "\
+        let expected_default = "\
+{
+  \"name\": \"tvek\",
+  \"version\": 1,
+  \"active\": true,
+  \"nothing\": null,
+  \"items\": [1, -2.5, 3e10, 4.5e-2],
+  \"nested\": {
+    \"empty_obj\": {},
+    \"empty_arr\": []
+  }
+}
+";
+        assert_eq!(fmt_default(input).unwrap(), expected_default);
+
+        let structural_opts = FormatOptions {
+            line_width: 0,
+            ..FormatOptions::default()
+        };
+        let expected_structural = "\
 {
   \"name\": \"tvek\",
   \"version\": 1,
@@ -3631,7 +3915,9 @@ mod tests {
   }
 }
 ";
-        assert_eq!(fmt_default(input).unwrap(), expected);
+        let out_structural =
+            String::from_utf8(format_json(input.as_bytes(), &structural_opts).unwrap()).unwrap();
+        assert_eq!(out_structural, expected_structural);
     }
 
     #[test]
@@ -3651,9 +3937,7 @@ mod tests {
         let input = "{\n  \"a\": 1,\n  \"b\": [ true, false, null, { }, [ ] ],\n  \"c\": \"hello world\"\n}\n";
         let opts = FormatOptions {
             minify: true,
-            indent: 2,
-            sort_keys: false,
-            allow_comments: true,
+            ..FormatOptions::default()
         };
         let out = String::from_utf8(format_json(input.as_bytes(), &opts).unwrap()).unwrap();
         assert_eq!(
@@ -3666,34 +3950,53 @@ mod tests {
     fn test_indent_4_and_tab() {
         let input = r#"{"a":{"b":[1,2]}}"#;
         let opts_4 = FormatOptions {
-            minify: false,
             indent: 4,
-            sort_keys: false,
-            allow_comments: true,
+            ..FormatOptions::default()
         };
         let out_4 = String::from_utf8(format_json(input.as_bytes(), &opts_4).unwrap()).unwrap();
-        let expected_4 = "{\n    \"a\": {\n        \"b\": [\n            1,\n            2\n        ]\n    }\n}\n";
+        let expected_4 = "{\n    \"a\": {\n        \"b\": [1, 2]\n    }\n}\n";
         assert_eq!(out_4, expected_4);
 
+        let opts_4_structural = FormatOptions {
+            indent: 4,
+            line_width: 0,
+            ..FormatOptions::default()
+        };
+        let out_4_structural =
+            String::from_utf8(format_json(input.as_bytes(), &opts_4_structural).unwrap()).unwrap();
+        assert_eq!(
+            out_4_structural,
+            "{\n    \"a\": {\n        \"b\": [\n            1,\n            2\n        ]\n    }\n}\n"
+        );
+
         let opts_tab = FormatOptions {
-            minify: false,
             indent: 0,
-            sort_keys: false,
-            allow_comments: true,
+            ..FormatOptions::default()
         };
         let out_tab = String::from_utf8(format_json(input.as_bytes(), &opts_tab).unwrap()).unwrap();
-        let expected_tab = "{\n\t\"a\": {\n\t\t\"b\": [\n\t\t\t1,\n\t\t\t2\n\t\t]\n\t}\n}\n";
+        let expected_tab = "{\n\t\"a\": {\n\t\t\"b\": [1, 2]\n\t}\n}\n";
         assert_eq!(out_tab, expected_tab);
+
+        let opts_tab_structural = FormatOptions {
+            indent: 0,
+            line_width: 0,
+            ..FormatOptions::default()
+        };
+        let out_tab_structural =
+            String::from_utf8(format_json(input.as_bytes(), &opts_tab_structural).unwrap())
+                .unwrap();
+        assert_eq!(
+            out_tab_structural,
+            "{\n\t\"a\": {\n\t\t\"b\": [\n\t\t\t1,\n\t\t\t2\n\t\t]\n\t}\n}\n"
+        );
     }
 
     #[test]
     fn test_sort_keys_recursive() {
         let input = r#"{"z": 1, "a": {"d": 4, "c": 3}, "m": [{"y": 2, "x": 1}]}"#;
         let opts = FormatOptions {
-            minify: false,
-            indent: 2,
             sort_keys: true,
-            allow_comments: true,
+            ..FormatOptions::default()
         };
         let out = String::from_utf8(format_json(input.as_bytes(), &opts).unwrap()).unwrap();
         let expected = "\
@@ -3788,19 +4091,16 @@ mod tests {
     fn test_tvek_02_output_amplification_bound() {
         let nested = "[".repeat(100) + "1" + &"]".repeat(100);
         let opts = FormatOptions {
-            minify: false,
             indent: 64,
-            sort_keys: false,
-            allow_comments: true,
+            ..FormatOptions::default()
         };
         let err = format_json_with_limit(nested.as_bytes(), &opts, 4096).unwrap_err();
         assert!(err.message.contains("exceeds maximum allowed buffer size"));
 
         let opts_sorted = FormatOptions {
-            minify: false,
             indent: 64,
             sort_keys: true,
-            allow_comments: true,
+            ..FormatOptions::default()
         };
         let err_sorted = format_json_with_limit(nested.as_bytes(), &opts_sorted, 4096).unwrap_err();
         assert!(err_sorted
@@ -3822,10 +4122,8 @@ mod tests {
         assert_eq!(err2.offset, 22);
 
         let sort_opts = FormatOptions {
-            minify: false,
-            indent: 2,
             sort_keys: true,
-            allow_comments: true,
+            ..FormatOptions::default()
         };
         let err3 = format_json(dup_escaped.as_bytes(), &sort_opts).unwrap_err();
         assert!(err3.message.contains("Duplicate object key"));
@@ -3852,9 +4150,8 @@ mod tests {
             .spawn(move || {
                 let opts = FormatOptions {
                     minify: true,
-                    indent: 2,
                     sort_keys: true,
-                    allow_comments: true,
+                    ..FormatOptions::default()
                 };
                 let res = format_json(payload.as_bytes(), &opts).unwrap();
                 assert!(res.starts_with(b"{\"a\":[{\"a\":["));
@@ -3874,9 +4171,8 @@ mod tests {
         arr.push(']');
         let opts = FormatOptions {
             minify: true,
-            indent: 2,
             sort_keys: true,
-            allow_comments: true,
+            ..FormatOptions::default()
         };
         let err = format_json_with_limit(arr.as_bytes(), &opts, 2048).unwrap_err();
         assert!(err.message.contains("exceeds maximum allowed buffer size"));
@@ -3974,9 +4270,7 @@ mod tests {
         // Verify --minify strips all comments cleanly
         let minify_opts = FormatOptions {
             minify: true,
-            indent: 2,
-            sort_keys: false,
-            allow_comments: true,
+            ..FormatOptions::default()
         };
         let minified =
             String::from_utf8(format_json(input.as_bytes(), &minify_opts).unwrap()).unwrap();
@@ -3994,10 +4288,8 @@ mod tests {
         assert_eq!(fmt_default(arr_input).unwrap(), expected_arr);
 
         let sort_opts = FormatOptions {
-            minify: false,
-            indent: 2,
             sort_keys: true,
-            allow_comments: true,
+            ..FormatOptions::default()
         };
         assert_eq!(
             String::from_utf8(format_json(obj_input.as_bytes(), &sort_opts).unwrap()).unwrap(),
@@ -4010,9 +4302,7 @@ mod tests {
 
         let minify_opts = FormatOptions {
             minify: true,
-            indent: 2,
-            sort_keys: false,
-            allow_comments: true,
+            ..FormatOptions::default()
         };
         assert_eq!(
             String::from_utf8(format_json(obj_input.as_bytes(), &minify_opts).unwrap()).unwrap(),
@@ -4049,19 +4339,16 @@ mod tests {
 // EOF comment
 ";
         let sort_opts = FormatOptions {
-            minify: false,
-            indent: 2,
             sort_keys: true,
-            allow_comments: true,
+            ..FormatOptions::default()
         };
         let out = String::from_utf8(format_json(input.as_bytes(), &sort_opts).unwrap()).unwrap();
         assert_eq!(out, expected);
 
         let minify_sort_opts = FormatOptions {
             minify: true,
-            indent: 2,
             sort_keys: true,
-            allow_comments: true,
+            ..FormatOptions::default()
         };
         let out_min =
             String::from_utf8(format_json(input.as_bytes(), &minify_sort_opts).unwrap()).unwrap();
@@ -4083,10 +4370,8 @@ mod tests {
         assert!(err_block.message.contains("strict RFC 8259"));
 
         let strict_opts = FormatOptions {
-            minify: false,
-            indent: 2,
-            sort_keys: false,
             allow_comments: false,
+            ..FormatOptions::default()
         };
         assert!(format_json(with_line_comment, &strict_opts).is_err());
         assert!(format_json(with_block_comment, &strict_opts).is_err());
@@ -4171,9 +4456,8 @@ mod tests {
         // 20 elements * size_of::<SortedArrayItem>() (128 bytes) + root SortedValue (80 bytes) = 2640 bytes > 2048
         let sort_opts = FormatOptions {
             minify: true,
-            indent: 2,
             sort_keys: true,
-            allow_comments: true,
+            ..FormatOptions::default()
         };
         let err = format_json_with_limit(arr.as_bytes(), &sort_opts, 2048).unwrap_err();
         assert!(err.message.contains("exceeds maximum allowed buffer size"));
@@ -4260,5 +4544,49 @@ mod tests {
             let spaces_and_brace = format!("{}{{}}", " ".repeat(offset + 40));
             assert_eq!(skip_ascii_spaces(spaces_and_brace.as_bytes()), offset + 40);
         }
+    }
+
+    #[test]
+    fn test_width_aware_inline_array_and_structural_mode() {
+        // 1. User sample: default width-aware (line_width = 80) keeps short scalar arrays inline
+        let sample = "{\"first\": [\n  1,\n  2,\n  3\n], \"second\": [1, 2, 3]}";
+        let expected_inline = "{\n  \"first\": [1, 2, 3],\n  \"second\": [1, 2, 3]\n}\n";
+        assert_eq!(fmt_default(sample).unwrap(), expected_inline);
+
+        // 2. --sort-keys produces the exact same width-aware inline array output
+        let sort_opts = FormatOptions {
+            sort_keys: true,
+            ..FormatOptions::default()
+        };
+        assert_eq!(
+            String::from_utf8(format_json(sample.as_bytes(), &sort_opts).unwrap()).unwrap(),
+            expected_inline
+        );
+
+        // 3. --structural (line_width: 0) expands every element onto its own line
+        let structural_opts = FormatOptions {
+            line_width: 0,
+            ..FormatOptions::default()
+        };
+        let expected_structural =
+            "{\n  \"first\": [\n    1,\n    2,\n    3\n  ],\n  \"second\": [\n    1,\n    2,\n    3\n  ]\n}\n";
+        assert_eq!(
+            String::from_utf8(format_json(sample.as_bytes(), &structural_opts).unwrap()).unwrap(),
+            expected_structural
+        );
+
+        // 4. Scalar arrays exceeding 80 columns expand automatically in both streaming and --sort-keys
+        let long_arr = r#"{"numbers": [1000000001, 1000000002, 1000000003, 1000000004, 1000000005, 1000000006, 1000000007]}"#;
+        let formatted_long = fmt_default(long_arr).unwrap();
+        assert!(formatted_long.contains("\"numbers\": [\n    1000000001,"));
+        let sorted_long =
+            String::from_utf8(format_json(long_arr.as_bytes(), &sort_opts).unwrap()).unwrap();
+        assert_eq!(formatted_long, sorted_long);
+
+        // 5. Arrays containing comments or nested containers expand to multi-line while inner scalar arrays stay inline
+        let nested_and_comment =
+            "{\n  \"with_comment\": [1, /* c */ 2],\n  \"matrix\": [[1, 2], [3, 4]]\n}";
+        let expected_nested = "{\n  \"with_comment\": [\n    1, /* c */\n    2\n  ],\n  \"matrix\": [\n    [1, 2],\n    [3, 4]\n  ]\n}\n";
+        assert_eq!(fmt_default(nested_and_comment).unwrap(), expected_nested);
     }
 }

@@ -106,7 +106,8 @@ jobs:
           cargo build --locked --release
           ./target/release/tvek --version
           printf '{"b":1,"a":[true,null,"ok"]}' | ./target/release/tvek --sort-keys --check - && exit 1 || true
-          printf '{\n  "a": [\n    true,\n    null,\n    "ok"\n  ],\n  "b": 1\n}\n' | ./target/release/tvek --sort-keys --check -
+          printf '{\n  "a": [true, null, "ok"],\n  "b": 1\n}\n' | ./target/release/tvek --sort-keys --check -
+          printf '{\n  "a": [\n    true,\n    null,\n    "ok"\n  ],\n  "b": 1\n}\n' | ./target/release/tvek --structural --sort-keys --check -
 
   supply-chain-audit:
     name: Supply-Chain & Manifest Audit
