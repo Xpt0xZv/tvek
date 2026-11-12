@@ -48,14 +48,17 @@ tvek server [OPTIONS]
 | `-c, --check` | Lint and verify formatting without modifying files (exits `1` if unformatted or invalid) |
 | `-l, --lint` | Lint syntax only, ignoring whitespace/indentation differences |
 | `-w, --write` | Format files in-place atomically (only writes if formatted output differs) |
+| `-f, --fix` | Auto-fix safe syntax errors (trailing commas, UTF-8 BOM, and `--strict` comments) |
 | `-m, --minify` | Output compact single-line JSON with all insignificant whitespace and comments stripped |
 | `-i, --indent <N>` | Number of spaces per indentation level (default: `2`; `0` uses `\t`) |
 | `-s, --sort-keys` | Lexicographically sort object keys at every nesting level |
+| `--structural` | Expand all non-empty arrays across multiple lines (disables width-aware inline arrays) |
+| `--line-width <N>` | Target line width for inline scalar arrays (default: `80`, max: `4096`, `0` = structural) |
 | `--strict` | Enforce strict RFC 8259 JSON (disallow `//` and `/* */` comments; alias `--no-comments`) |
 | `--max-size <BYTES>` | Maximum input size in bytes (default: `104857600` / 100 MiB) |
 | `--lsp` | Start the Language Server Protocol (LSP) server over stdio (alias for `tvek server`) |
 | `-q, --quiet` | Suppress non-error output |
-| `-v, --version` | Print `tvek 0.1.2` and exit `0` |
+| `-v, --version` | Print `tvek 0.1.3` and exit `0` |
 | `-h, --help` | Print CLI help documentation and exit `0` |
 
 ## Language Server (`tvek server`)
