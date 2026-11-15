@@ -6,7 +6,7 @@
 
 - **Zero External Dependencies**: Built exclusively with the Rust standard library (`std`)—no third-party crates.
 - **Single-Pass Streaming Byte Engine**: Validates RFC 8259 / JSONC syntax and emits formatted output in a single byte-level pass (`&[u8]`) with 8-byte SWAR string scanning and pre-allocated indentation tables, without constructing an intermediate DOM/AST (unless `--sort-keys` is explicitly requested).
-- **First-Class JSONC (JSON with Comments) Support**: Preserves and re-indents single-line (`// ...`) and block (`/* ... */`) comments by default—including moving comments with their attached keys under `--sort-keys` and stripping them under `--minify`. Pass `--strict` (or `--no-comments`) to enforce strict comment-free RFC 8259 validation.
+- **First-Class JSONC (JSON with Comments) Support**: Preserves and re-indents single-line (`// ...`) and block (`/* ... */`) comments by default—separating standalone comment blocks from preceding entries with a blank line, keeping consecutive standalone comments grouped together, moving comments with their attached keys under `--sort-keys`, and stripping them under `--minify`. Pass `--strict` (or `--no-comments`) to enforce strict comment-free RFC 8259 validation.
 - **Multi-Threaded Batch Processing**: Automatically discovers `.json` and `.jsonc` files and scales across available CPU cores via `std::thread::scope` when linting, checking, or formatting multiple files in-place, with canonical path deduplication.
 - **Strict RFC 8259 Compliance**:
   - Rejects UTF-8 byte order marks (`0xEF 0xBB 0xBF` BOM) at offset `0` with an explicit diagnostic per RFC 8259 §8.1.
@@ -58,7 +58,7 @@ tvek server [OPTIONS]
 | `--max-size <BYTES>` | Maximum input size in bytes (default: `104857600` / 100 MiB) |
 | `--lsp` | Start the Language Server Protocol (LSP) server over stdio (alias for `tvek server`) |
 | `-q, --quiet` | Suppress non-error output |
-| `-v, --version` | Print `tvek 0.1.3` and exit `0` |
+| `-v, --version` | Print `tvek 0.1.4` and exit `0` |
 | `-h, --help` | Print CLI help documentation and exit `0` |
 
 ## Language Server (`tvek server`)
