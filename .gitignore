@@ -10,9 +10,10 @@ __pycache__/
 *.egg-info/
 *.whl
 
-# IDE / OS
+# IDE / OS / Local Agent Context
 /.idea/
 /.vscode/
+/AGENTS.md
 .DS_Store
 Thumbs.db
 .*.tvek_tmp_*
