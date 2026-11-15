@@ -403,29 +403,20 @@ pub fn format_json_into_buf(
         let root = builder
             .current_val
             .ok_or_else(|| SyntaxError::new("Unexpected end of JSON input", input.len(), input))?;
-        if !options.minify {
-            for comment in &builder.root_leading_comments {
-                emit_comment_raw(&mut sink, comment.raw)
-                    .map_err(|msg| SyntaxError::new(msg, comment.pos, input))?;
-                sink.push_byte(b'\n')
-                    .map_err(|msg| SyntaxError::new(msg, comment.pos, input))?;
-            }
-        }
+        emit_root_leading_comments(
+            &mut sink,
+            &builder.root_leading_comments,
+            options.minify,
+            input,
+        )?;
         emit_sorted_value_iterative(&root, &mut sink, options, &indent_table)
             .map_err(|msg| SyntaxError::new(msg, input.len(), input))?;
-        if !options.minify {
-            for comment in &builder.root_trailing_comments {
-                if comment.inline_with_prev {
-                    sink.push_byte(b' ')
-                        .map_err(|msg| SyntaxError::new(msg, comment.pos, input))?;
-                } else {
-                    sink.push_byte(b'\n')
-                        .map_err(|msg| SyntaxError::new(msg, comment.pos, input))?;
-                }
-                emit_comment_raw(&mut sink, comment.raw)
-                    .map_err(|msg| SyntaxError::new(msg, comment.pos, input))?;
-            }
-        }
+        emit_root_trailing_comments(
+            &mut sink,
+            &builder.root_trailing_comments,
+            options.minify,
+            input,
+        )?;
         sink.push_byte(b'\n')
             .map_err(|msg| SyntaxError::new(msg, input.len(), input))?;
     } else {
@@ -539,6 +530,50 @@ fn split_inline_comments<'b, 'a>(
         .position(|c| !c.inline_with_prev)
         .unwrap_or(comments.len());
     (&comments[..split], &comments[split..])
+}
+
+#[inline]
+fn emit_root_leading_comments<S: OutputSink>(
+    out: &mut S,
+    comments: &[CommentPiece<'_>],
+    minify: bool,
+    input: &[u8],
+) -> Result<(), SyntaxError> {
+    if !minify {
+        for c in comments {
+            emit_comment_raw(out, c.raw).map_err(|msg| SyntaxError::new(msg, c.pos, input))?;
+            out.push_byte(b'\n')
+                .map_err(|msg| SyntaxError::new(msg, c.pos, input))?;
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn emit_root_trailing_comments<S: OutputSink>(
+    out: &mut S,
+    trailing_comments: &[CommentPiece<'_>],
+    minify: bool,
+    input: &[u8],
+) -> Result<(), SyntaxError> {
+    if !minify && !trailing_comments.is_empty() {
+        let (inline_root, standalone_eof) = split_inline_comments(trailing_comments);
+        for c in inline_root {
+            out.push_byte(b' ')
+                .map_err(|msg| SyntaxError::new(msg, c.pos, input))?;
+            emit_comment_raw(out, c.raw).map_err(|msg| SyntaxError::new(msg, c.pos, input))?;
+        }
+        if !standalone_eof.is_empty() {
+            out.push_byte(b'\n')
+                .map_err(|msg| SyntaxError::new(msg, standalone_eof[0].pos, input))?;
+            for c in standalone_eof {
+                out.push_byte(b'\n')
+                    .map_err(|msg| SyntaxError::new(msg, c.pos, input))?;
+                emit_comment_raw(out, c.raw).map_err(|msg| SyntaxError::new(msg, c.pos, input))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Zero-cost generic event interface unifying single-pass streaming and `--sort-keys` DOM construction (IMP-06).
@@ -746,9 +781,15 @@ impl<'a, 'b, S: OutputSink> StreamEmitter<'a, 'b, S> {
         &mut self,
         comments: &[CommentPiece<'a>],
         depth: usize,
+        blank_line_before: bool,
         input: &'a [u8],
     ) -> Result<(), SyntaxError> {
         if !self.minify && !comments.is_empty() {
+            if blank_line_before {
+                self.out
+                    .push_byte(b'\n')
+                    .map_err(|msg| SyntaxError::new(msg, comments[0].pos, input))?;
+            }
             for c in comments {
                 self.out
                     .push_byte(b'\n')
@@ -785,16 +826,7 @@ impl<'a, 'b, S: OutputSink> ParseEvents<'a> for StreamEmitter<'a, 'b, S> {
         comments: &[CommentPiece<'a>],
         input: &'a [u8],
     ) -> Result<(), SyntaxError> {
-        if !self.minify {
-            for c in comments {
-                emit_comment_raw(self.out, c.raw)
-                    .map_err(|msg| SyntaxError::new(msg, c.pos, input))?;
-                self.out
-                    .push_byte(b'\n')
-                    .map_err(|msg| SyntaxError::new(msg, c.pos, input))?;
-            }
-        }
-        Ok(())
+        emit_root_leading_comments(self.out, comments, self.minify, input)
     }
 
     #[inline(always)]
@@ -811,7 +843,7 @@ impl<'a, 'b, S: OutputSink> ParseEvents<'a> for StreamEmitter<'a, 'b, S> {
             .push_byte(b'{')
             .map_err(|msg| SyntaxError::new(msg, open_pos, input))?;
         if !self.minify && !comments.is_empty() {
-            self.emit_standalone_comments(comments, depth + 1, input)?;
+            self.emit_standalone_comments(comments, depth + 1, false, input)?;
             self.out
                 .push_byte(b'\n')
                 .map_err(|msg| SyntaxError::new(msg, close_pos, input))?;
@@ -838,7 +870,7 @@ impl<'a, 'b, S: OutputSink> ParseEvents<'a> for StreamEmitter<'a, 'b, S> {
             .push_byte(b'{')
             .map_err(|msg| SyntaxError::new(msg, open_pos, input))?;
         self.emit_inline_comments(open_comments, input)?;
-        self.emit_standalone_comments(first_leading, new_depth, input)?;
+        self.emit_standalone_comments(first_leading, new_depth, false, input)?;
         if !self.minify {
             self.out
                 .push_byte(b'\n')
@@ -884,7 +916,7 @@ impl<'a, 'b, S: OutputSink> ParseEvents<'a> for StreamEmitter<'a, 'b, S> {
             .push_byte(b',')
             .map_err(|msg| SyntaxError::new(msg, comma_pos, input))?;
         self.emit_inline_comments(prev_trailing, input)?;
-        self.emit_standalone_comments(next_leading, depth, input)?;
+        self.emit_standalone_comments(next_leading, depth, true, input)?;
         if !self.minify {
             self.out
                 .push_byte(b'\n')
@@ -907,7 +939,7 @@ impl<'a, 'b, S: OutputSink> ParseEvents<'a> for StreamEmitter<'a, 'b, S> {
         self.last_key_len = 0;
         let inner_depth = self.stack.len();
         self.emit_inline_comments(last_trailing, input)?;
-        self.emit_standalone_comments(inner_trailing, inner_depth, input)?;
+        self.emit_standalone_comments(inner_trailing, inner_depth, true, input)?;
         if let Some(StreamFrame::Object(mut key_set)) = self.stack.pop() {
             let freed = key_set.clear();
             self.allocated_key_bytes = self.allocated_key_bytes.saturating_sub(freed);
@@ -942,7 +974,7 @@ impl<'a, 'b, S: OutputSink> ParseEvents<'a> for StreamEmitter<'a, 'b, S> {
             .push_byte(b'[')
             .map_err(|msg| SyntaxError::new(msg, open_pos, input))?;
         if !self.minify && !comments.is_empty() {
-            self.emit_standalone_comments(comments, depth + 1, input)?;
+            self.emit_standalone_comments(comments, depth + 1, false, input)?;
             self.out
                 .push_byte(b'\n')
                 .map_err(|msg| SyntaxError::new(msg, close_pos, input))?;
@@ -969,7 +1001,7 @@ impl<'a, 'b, S: OutputSink> ParseEvents<'a> for StreamEmitter<'a, 'b, S> {
             .push_byte(b'[')
             .map_err(|msg| SyntaxError::new(msg, open_pos, input))?;
         self.emit_inline_comments(open_comments, input)?;
-        self.emit_standalone_comments(first_leading, new_depth, input)?;
+        self.emit_standalone_comments(first_leading, new_depth, false, input)?;
         if !self.minify {
             self.out
                 .push_byte(b'\n')
@@ -997,7 +1029,7 @@ impl<'a, 'b, S: OutputSink> ParseEvents<'a> for StreamEmitter<'a, 'b, S> {
             .push_byte(b',')
             .map_err(|msg| SyntaxError::new(msg, comma_pos, input))?;
         self.emit_inline_comments(prev_trailing, input)?;
-        self.emit_standalone_comments(next_leading, depth, input)?;
+        self.emit_standalone_comments(next_leading, depth, true, input)?;
         if !self.minify {
             self.out
                 .push_byte(b'\n')
@@ -1020,7 +1052,7 @@ impl<'a, 'b, S: OutputSink> ParseEvents<'a> for StreamEmitter<'a, 'b, S> {
         self.last_key_len = 0;
         let inner_depth = self.stack.len();
         self.emit_inline_comments(last_trailing, input)?;
-        self.emit_standalone_comments(inner_trailing, inner_depth, input)?;
+        self.emit_standalone_comments(inner_trailing, inner_depth, true, input)?;
         self.stack.pop();
         if !self.minify {
             self.out
@@ -1102,21 +1134,7 @@ impl<'a, 'b, S: OutputSink> ParseEvents<'a> for StreamEmitter<'a, 'b, S> {
         end_pos: usize,
         input: &'a [u8],
     ) -> Result<(), SyntaxError> {
-        if !self.minify {
-            for c in trailing_comments {
-                if c.inline_with_prev {
-                    self.out
-                        .push_byte(b' ')
-                        .map_err(|msg| SyntaxError::new(msg, c.pos, input))?;
-                } else {
-                    self.out
-                        .push_byte(b'\n')
-                        .map_err(|msg| SyntaxError::new(msg, c.pos, input))?;
-                }
-                emit_comment_raw(self.out, c.raw)
-                    .map_err(|msg| SyntaxError::new(msg, c.pos, input))?;
-            }
-        }
+        emit_root_trailing_comments(self.out, trailing_comments, self.minify, input)?;
         self.out
             .push_byte(b'\n')
             .map_err(|msg| SyntaxError::new(msg, end_pos, input))
@@ -2901,9 +2919,13 @@ fn emit_sorted_standalone_comments<S: OutputSink>(
     comments: &[CommentPiece<'_>],
     indent_table: &IndentTable,
     depth: usize,
+    blank_line_before: bool,
     minify: bool,
 ) -> Result<(), &'static str> {
-    if !minify {
+    if !minify && !comments.is_empty() {
+        if blank_line_before {
+            out.push_byte(b'\n')?;
+        }
         for c in comments {
             out.push_byte(b'\n')?;
             out.push_indent(indent_table, depth)?;
@@ -2944,6 +2966,7 @@ fn emit_sorted_value_iterative<'b, 'a, S: OutputSink>(
                             inner_trailing_comments,
                             indent_table,
                             parent_depth + 1,
+                            false,
                             minify,
                         )?;
                         out.push_byte(b'\n')?;
@@ -3024,6 +3047,7 @@ fn emit_sorted_value_iterative<'b, 'a, S: OutputSink>(
                             &first.leading_comments,
                             indent_table,
                             child_depth,
+                            false,
                             minify,
                         )?;
                         if !minify {
@@ -3054,6 +3078,7 @@ fn emit_sorted_value_iterative<'b, 'a, S: OutputSink>(
                             inner_trailing_comments,
                             indent_table,
                             parent_depth + 1,
+                            false,
                             minify,
                         )?;
                         out.push_byte(b'\n')?;
@@ -3070,6 +3095,7 @@ fn emit_sorted_value_iterative<'b, 'a, S: OutputSink>(
                         &first.leading_comments,
                         indent_table,
                         child_depth,
+                        false,
                         minify,
                     )?;
                     if !minify {
@@ -3114,6 +3140,7 @@ fn emit_sorted_value_iterative<'b, 'a, S: OutputSink>(
                             &next_item.leading_comments,
                             indent_table,
                             depth,
+                            true,
                             minify,
                         )?;
                         if !minify {
@@ -3130,6 +3157,7 @@ fn emit_sorted_value_iterative<'b, 'a, S: OutputSink>(
                             trailing_in_arr,
                             indent_table,
                             depth,
+                            true,
                             minify,
                         )?;
                         stack.pop();
@@ -3156,6 +3184,7 @@ fn emit_sorted_value_iterative<'b, 'a, S: OutputSink>(
                             &next_entry.leading_comments,
                             indent_table,
                             depth,
+                            true,
                             minify,
                         )?;
                         if !minify {
@@ -3177,6 +3206,7 @@ fn emit_sorted_value_iterative<'b, 'a, S: OutputSink>(
                             trailing_in_obj,
                             indent_table,
                             depth,
+                            true,
                             minify,
                         )?;
                         stack.pop();
@@ -4390,12 +4420,33 @@ mod tests {
 } // inline root comment
 // EOF comment
 ";
+        let expected = "\
+// Leading file comment
+/* Second header comment */
+{ // open brace comment
+  // comment before host
+  \"host\": \"localhost\", // inline host comment
+  \"ports\": [ /* open bracket comment */
+    // first port
+    8080, // http
+
+    /* https */
+    8443 // last port
+
+    // end of ports array
+  ]
+
+  // end of root object
+} // inline root comment
+
+// EOF comment
+";
         let formatted = fmt_default(input).unwrap();
-        assert_eq!(formatted, input);
+        assert_eq!(formatted, expected);
 
         // Verify idempotency when formatting a second time
         let formatted_twice = fmt_default(&formatted).unwrap();
-        assert_eq!(formatted_twice, input);
+        assert_eq!(formatted_twice, expected);
 
         // Verify --minify strips all comments cleanly
         let minify_opts = FormatOptions {
@@ -4462,10 +4513,13 @@ mod tests {
 {
   // Comment for a
   \"a\": 2, // inline on a
+
   // Comment for b
   \"b\": 1 // inline on b
+
   // Footer inside object
 }
+
 // EOF comment
 ";
         let sort_opts = FormatOptions {
@@ -4740,13 +4794,13 @@ mod tests {
         assert!(fmt_default(commented).is_err());
         let fixed_commented =
             String::from_utf8(format_json(commented.as_bytes(), &fix_opts).unwrap()).unwrap();
-        let expected_commented = "{\n  \"a\": 1 /* before */ // after\n  // footer\n}\n";
+        let expected_commented = "{\n  \"a\": 1 /* before */ // after\n\n  // footer\n}\n";
         assert_eq!(fixed_commented, expected_commented);
 
         let arr_commented = "[\n  1 /* before */, // after\n  // footer\n]\n";
         let fixed_arr_commented =
             String::from_utf8(format_json(arr_commented.as_bytes(), &fix_opts).unwrap()).unwrap();
-        let expected_arr_commented = "[\n  1 /* before */ // after\n  // footer\n]\n";
+        let expected_arr_commented = "[\n  1 /* before */ // after\n\n  // footer\n]\n";
         assert_eq!(fixed_arr_commented, expected_arr_commented);
 
         // 3. --strict --fix strips // and /* */ comments to produce strict RFC 8259 JSON
@@ -4767,5 +4821,631 @@ mod tests {
         assert!(format_json(dup_keys, &fix_opts).is_err());
         let bare_cr_comment = b"{\n  /* *\r/ \"admin\": true, /* */\n  \"admin\": false\n}";
         assert!(format_json(bare_cr_comment, &strict_fix_opts).is_err());
+    }
+
+    #[test]
+    fn test_jsonc_standalone_comment_blank_lines_all_10_grammar_positions_and_sort_parity() {
+        // Exercises all 10 grammar positions with single-line `//`, multiline consecutive `//`
+        // (including pre-existing blank lines between consecutive comments that must collapse),
+        // and multiline `/* ... */` block comments (preserving interior blank lines):
+        //   1. root_leading_comments
+        //   2. on_empty_object
+        //   3. on_empty_array
+        //   4. on_open_object (open_comments + first_leading)
+        //   5. on_open_array (open_comments + first_leading)
+        //   6. on_object_next_key (prev_trailing + next_leading)
+        //   7. on_close_object (last_trailing + inner_trailing)
+        //   8. on_array_comma (prev_trailing + next_leading)
+        //   9. on_close_array (last_trailing + inner_trailing)
+        //  10. root_trailing_comments (inline_root + standalone_eof, plus scalar root)
+        let input = "\
+// root lead 1
+
+// root lead 2
+/* root block
+ *
+ * interior blank preserved
+ */
+{ // open obj inline
+  // first obj lead 1
+
+  // first obj lead 2
+  \"a_empty_obj\": {
+    // empty obj 1
+
+    /* empty obj 2 */
+  }, // inline after a_empty_obj
+  // next key single line
+  \"b_empty_arr\": [
+    // empty arr 1
+
+    // empty arr 2
+  ],
+  // next key group line 1
+
+  // next key group line 2
+  /* next key block
+     line 2 */
+  \"c_arr\": [ /* open arr inline */
+    // first arr lead 1
+
+    // first arr lead 2
+    10, // inline after 10
+    // before 20 line 1
+
+    // before 20 line 2
+    20,
+    /* multiline block before 30
+     *
+     * keep interior blank
+     */
+    30 // inline after 30
+    // arr trailing 1
+
+    /* arr trailing 2 */
+  ], // inline after c_arr
+  \"d_no_standalone\": true // inline after d
+  // obj trailing 1
+
+  // obj trailing 2
+} /* inline root 1 */ // inline root 2
+// eof trailing 1
+
+/* eof trailing 2
+ * second line
+ */
+";
+
+        let expected = "\
+// root lead 1
+// root lead 2
+/* root block
+ *
+ * interior blank preserved
+ */
+{ // open obj inline
+  // first obj lead 1
+  // first obj lead 2
+  \"a_empty_obj\": {
+    // empty obj 1
+    /* empty obj 2 */
+  }, // inline after a_empty_obj
+
+  // next key single line
+  \"b_empty_arr\": [
+    // empty arr 1
+    // empty arr 2
+  ],
+
+  // next key group line 1
+  // next key group line 2
+  /* next key block
+     line 2 */
+  \"c_arr\": [ /* open arr inline */
+    // first arr lead 1
+    // first arr lead 2
+    10, // inline after 10
+
+    // before 20 line 1
+    // before 20 line 2
+    20,
+
+    /* multiline block before 30
+     *
+     * keep interior blank
+     */
+    30 // inline after 30
+
+    // arr trailing 1
+    /* arr trailing 2 */
+  ], // inline after c_arr
+  \"d_no_standalone\": true // inline after d
+
+  // obj trailing 1
+  // obj trailing 2
+} /* inline root 1 */ // inline root 2
+
+// eof trailing 1
+/* eof trailing 2
+ * second line
+ */
+";
+
+        let stream_out = fmt_default(input).unwrap();
+        assert_eq!(stream_out, expected);
+
+        // Idempotency in streaming mode: format(format(x)) == format(x)
+        let stream_twice = fmt_default(&stream_out).unwrap();
+        assert_eq!(stream_twice, expected);
+
+        // Exact byte-for-byte parity with --sort-keys and idempotency in --sort-keys mode
+        let sort_opts = FormatOptions {
+            sort_keys: true,
+            ..FormatOptions::default()
+        };
+        let sorted_out =
+            String::from_utf8(format_json(input.as_bytes(), &sort_opts).unwrap()).unwrap();
+        assert_eq!(sorted_out, expected);
+        let sorted_twice =
+            String::from_utf8(format_json(sorted_out.as_bytes(), &sort_opts).unwrap()).unwrap();
+        assert_eq!(sorted_twice, expected);
+
+        // Also verify scalar root value followed by inline and standalone EOF comments
+        let scalar_root = "// lead\n42 // inline scalar\n// eof 1\n\n// eof 2\n";
+        let expected_scalar = "// lead\n42 // inline scalar\n\n// eof 1\n// eof 2\n";
+        assert_eq!(fmt_default(scalar_root).unwrap(), expected_scalar);
+        assert_eq!(fmt_default(expected_scalar).unwrap(), expected_scalar);
+        let sorted_scalar =
+            String::from_utf8(format_json(scalar_root.as_bytes(), &sort_opts).unwrap()).unwrap();
+        assert_eq!(sorted_scalar, expected_scalar);
+
+        // Unsorted keys reordered by --sort-keys must produce canonical output that streaming preserves
+        let unsorted = "\
+{
+  \"z\": 1,
+  // comment moving to top of object
+  \"a\": 2
+}
+";
+        let sorted_reordered =
+            String::from_utf8(format_json(unsorted.as_bytes(), &sort_opts).unwrap()).unwrap();
+        let expected_reordered =
+            "{\n  // comment moving to top of object\n  \"a\": 2,\n  \"z\": 1\n}\n";
+        assert_eq!(sorted_reordered, expected_reordered);
+        assert_eq!(fmt_default(&sorted_reordered).unwrap(), expected_reordered);
+    }
+
+    #[test]
+    fn test_jsonc_blank_lines_zero_whitespace_across_indents_and_strict_fix_clean() {
+        let input = "\
+// header
+{
+  \"b\": [
+    1,
+    // array standalone
+    2
+    // array footer
+  ],
+  // object standalone 1
+
+  // object standalone 2
+  \"a\": {
+    \"x\": 10,
+    /* nested standalone */
+    \"y\": 20
+  }
+  // object footer
+}
+// eof footer
+";
+
+        for indent in [2usize, 4usize, 0usize] {
+            for sort_keys in [false, true] {
+                let opts = FormatOptions {
+                    indent,
+                    sort_keys,
+                    ..FormatOptions::default()
+                };
+                let out = String::from_utf8(format_json(input.as_bytes(), &opts).unwrap()).unwrap();
+
+                // Every visually blank line must have exact byte length 0 (zero spaces or tabs)
+                let blank_count = out
+                    .split('\n')
+                    .filter(|line| line.trim().is_empty())
+                    .inspect(|line| {
+                        assert!(
+                            line.is_empty(),
+                            "Blank line contained whitespace {:?} for indent={}, sort_keys={}",
+                            line,
+                            indent,
+                            sort_keys
+                        );
+                    })
+                    .count();
+                // Trailing `\n` yields 1 empty tail segment; `sort_keys == false` has 6 blank lines (7 segments),
+                // while `sort_keys == true` moves `"a"` (and its leading comments) to first position after `{`,
+                // suppressing that blank line (5 blank lines -> 6 segments).
+                let expected_empty_segments = if sort_keys { 6 } else { 7 };
+                assert_eq!(blank_count, expected_empty_segments);
+
+                // Verify idempotency under every (indent, sort_keys) pair
+                let out_twice =
+                    String::from_utf8(format_json(out.as_bytes(), &opts).unwrap()).unwrap();
+                assert_eq!(out_twice, out);
+            }
+        }
+
+        // Verify --strict --fix strips all comments cleanly with zero orphan blank lines
+        for sort_keys in [false, true] {
+            let strict_fix_opts = FormatOptions {
+                allow_comments: false,
+                fix: true,
+                sort_keys,
+                ..FormatOptions::default()
+            };
+            let stripped =
+                String::from_utf8(format_json(input.as_bytes(), &strict_fix_opts).unwrap())
+                    .unwrap();
+            assert!(
+                !stripped.contains("\n\n"),
+                "Unexpected orphan blank line after --strict --fix (sort_keys={}):\n{}",
+                sort_keys,
+                stripped
+            );
+            assert!(lint_json_strict(stripped.as_bytes(), DEFAULT_MAX_OUTPUT_BYTES).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_jsonc_blank_lines_max_output_bytes_exact_boundary() {
+        // Choose an input whose formatted output (with blank lines) exceeds DOM/key scratch bytes
+        // when indent is large, or test exact output byte boundaries in streaming mode and --sort-keys.
+        let input = "{\n  \"a\": [\n    1,\n    // arr c\n    2\n    // arr end\n  ],\n  // obj c\n  \"b\": 3\n  // obj end\n}\n// eof\n";
+        let full_stream = format_json(input.as_bytes(), &FormatOptions::default()).unwrap();
+
+        // Streaming mode: every limit below `full_stream.len()` must fail cleanly without panicking,
+        // including limits landing directly on the `b'\n'` blank-line bytes in object, array, and EOF.
+        for limit in 0..full_stream.len() {
+            let err = format_json_with_limit(input.as_bytes(), &FormatOptions::default(), limit)
+                .unwrap_err();
+            assert!(err.message.contains("exceeds maximum allowed buffer size"));
+        }
+        assert_eq!(
+            format_json_with_limit(
+                input.as_bytes(),
+                &FormatOptions::default(),
+                full_stream.len()
+            )
+            .unwrap(),
+            full_stream
+        );
+
+        // --sort-keys mode: use indent = 64 with nested containers + long comment text so formatted
+        // output (> 2.5 KiB) far exceeds DOM struct overhead (< 1.2 KiB), exercising exact byte-by-byte
+        // OutputSink limit enforcement across every blank-line `push_byte(b'\n')` up to `full_sorted.len() - 1`.
+        let long_banner = format!("// {}\n", "x".repeat(1400));
+        let nested_input = format!(
+            "{}{{\n  \"a\": {{\n    \"inner\": [\n      1,\n      // arr c\n      2\n      // arr end\n    ]\n    // inner end\n  }},\n  // obj c\n  \"b\": 3\n  // obj end\n}}\n// eof\n",
+            long_banner
+        );
+        let wide_sort_opts = FormatOptions {
+            indent: 64,
+            sort_keys: true,
+            ..FormatOptions::default()
+        };
+        let full_sorted = format_json(nested_input.as_bytes(), &wide_sort_opts).unwrap();
+        assert!(full_sorted.len() > 2500);
+        for limit in (full_sorted.len() - 512)..full_sorted.len() {
+            let err = format_json_with_limit(nested_input.as_bytes(), &wide_sort_opts, limit)
+                .unwrap_err();
+            assert!(err.message.contains("exceeds maximum allowed buffer size"));
+        }
+        assert_eq!(
+            format_json_with_limit(nested_input.as_bytes(), &wide_sort_opts, full_sorted.len())
+                .unwrap(),
+            full_sorted
+        );
+    }
+
+    #[test]
+    fn test_adversarial_jsonc_key_colon_before_after_comma_and_multiline_interiors() {
+        let sort_opts = FormatOptions {
+            sort_keys: true,
+            ..FormatOptions::default()
+        };
+
+        // 1. Comments around ':' (`"k" /* c1 */ : /* c2 */ v`) at index 0 vs index >= 1,
+        //    including when `--sort-keys` swaps index 0 ("z") and index 1 ("a").
+        let key_colon_input = "{ /* open */ \"z\" /* z1 */ : /* z2 */ 1, /* comma_in */ \"a\" /* a1 */ : /* a2 */ 2 }";
+        let expected_stream = concat!(
+            "{ /* open */\n",
+            "  /* z1 */\n",
+            "  /* z2 */\n",
+            "  \"z\": 1, /* comma_in */\n",
+            "\n",
+            "  /* a1 */\n",
+            "  /* a2 */\n",
+            "  \"a\": 2\n",
+            "}\n",
+        );
+        let stream_out = fmt_default(key_colon_input).unwrap();
+        assert_eq!(stream_out, expected_stream);
+        assert_eq!(fmt_default(&stream_out).unwrap(), expected_stream);
+
+        let expected_sorted = concat!(
+            "{ /* open */\n",
+            "  /* a1 */\n",
+            "  /* a2 */\n",
+            "  \"a\": 2,\n",
+            "\n",
+            "  /* z1 */\n",
+            "  /* z2 */\n",
+            "  \"z\": 1 /* comma_in */\n",
+            "}\n",
+        );
+        let sorted_out =
+            String::from_utf8(format_json(key_colon_input.as_bytes(), &sort_opts).unwrap())
+                .unwrap();
+        assert_eq!(sorted_out, expected_sorted);
+        assert_eq!(
+            String::from_utf8(format_json(sorted_out.as_bytes(), &sort_opts).unwrap()).unwrap(),
+            expected_sorted
+        );
+        assert_eq!(fmt_default(&sorted_out).unwrap(), expected_sorted);
+
+        // 2. Standalone comment *before* `,` combined with standalone comment *after* `,`,
+        //    plus inline block before `,`, standalone before `,`, inline after `,`, and standalone after `,`.
+        let around_comma = concat!(
+            "{\n",
+            "  \"a\": 1\n",
+            "  // before comma\n",
+            "  ,\n",
+            "  // after comma\n",
+            "  \"b\": 2 /* i_before */\n",
+            "  // s_before\n",
+            "  , /* i_after */\n",
+            "  // s_after\n",
+            "  \"c\": 3\n",
+            "}\n",
+        );
+        let expected_around_comma = concat!(
+            "{\n",
+            "  \"a\": 1,\n",
+            "\n",
+            "  // before comma\n",
+            "  // after comma\n",
+            "  \"b\": 2, /* i_before */ /* i_after */\n",
+            "\n",
+            "  // s_before\n",
+            "  // s_after\n",
+            "  \"c\": 3\n",
+            "}\n",
+        );
+        assert_eq!(fmt_default(around_comma).unwrap(), expected_around_comma);
+        assert_eq!(
+            fmt_default(expected_around_comma).unwrap(),
+            expected_around_comma
+        );
+        assert_eq!(
+            String::from_utf8(format_json(around_comma.as_bytes(), &sort_opts).unwrap()).unwrap(),
+            expected_around_comma
+        );
+
+        // 3. Multiline `/* ... */` preserving internal blank lines (including CRLF normalization)
+        //    while consecutive `/* a */\n\n/* b */` collapses inter-comment blank lines, and inline
+        //    multiline `/* l1\nl2 */ /* l3 */` splits cleanly and formats idempotently.
+        let multiline_blocks = concat!(
+            "{\r\n",
+            "  \"a\": 1, /* inline_m1\r\n",
+            "inline_m2 */ /* split_to_standalone */\r\n",
+            "\r\n",
+            "  /* block_a_p1\r\n",
+            "\r\n",
+            "\r\n",
+            "     block_a_p2 */\r\n",
+            "\r\n",
+            "  /* block_b */\r\n",
+            "  \"b\": 2\r\n",
+            "}\r\n",
+        );
+        let expected_blocks = concat!(
+            "{\n",
+            "  \"a\": 1, /* inline_m1\n",
+            "inline_m2 */\n",
+            "\n",
+            "  /* split_to_standalone */\n",
+            "  /* block_a_p1\n",
+            "\n",
+            "\n",
+            "     block_a_p2 */\n",
+            "  /* block_b */\n",
+            "  \"b\": 2\n",
+            "}\n",
+        );
+        let blocks_out = fmt_default(multiline_blocks).unwrap();
+        assert_eq!(blocks_out, expected_blocks);
+        assert_eq!(fmt_default(&blocks_out).unwrap(), expected_blocks);
+        assert_eq!(
+            String::from_utf8(format_json(multiline_blocks.as_bytes(), &sort_opts).unwrap())
+                .unwrap(),
+            expected_blocks
+        );
+
+        // 4. Root primitives (`true`, `false`, `null`, numbers, strings) with EOF comments
+        let root_bool = "true\n// eof1\n\n// eof2\n";
+        let expected_root_bool = "true\n\n// eof1\n// eof2\n";
+        assert_eq!(fmt_default(root_bool).unwrap(), expected_root_bool);
+        assert_eq!(fmt_default(expected_root_bool).unwrap(), expected_root_bool);
+        assert_eq!(
+            String::from_utf8(format_json(root_bool.as_bytes(), &sort_opts).unwrap()).unwrap(),
+            expected_root_bool
+        );
+
+        let root_str = "// top1\n\n// top2\n\"hello\" /* inline */ // inline2\n/* eof_p1\n\neof_p2 */\n\n// eof_last";
+        let expected_root_str = "// top1\n// top2\n\"hello\" /* inline */ // inline2\n\n/* eof_p1\n\neof_p2 */\n// eof_last\n";
+        assert_eq!(fmt_default(root_str).unwrap(), expected_root_str);
+        assert_eq!(fmt_default(expected_root_str).unwrap(), expected_root_str);
+        assert_eq!(
+            String::from_utf8(format_json(root_str.as_bytes(), &sort_opts).unwrap()).unwrap(),
+            expected_root_str
+        );
+    }
+
+    #[test]
+    fn test_adversarial_fix_trailing_commas_with_comments_stream_and_sorted() {
+        let fix_stream = FormatOptions {
+            fix: true,
+            ..FormatOptions::default()
+        };
+        let fix_sorted = FormatOptions {
+            fix: true,
+            sort_keys: true,
+            ..FormatOptions::default()
+        };
+        let plain_sorted = FormatOptions {
+            sort_keys: true,
+            ..FormatOptions::default()
+        };
+
+        // 1. Object trailing comma with standalone comment BEFORE `,`, inline comment ON `,`,
+        //    and standalone comment AFTER `,` before `}`, plus unsorted keys (`"z"`, `"a"`).
+        let obj_trailing = concat!(
+            "{\n",
+            "  \"z\": 10,\n",
+            "  // lead on a\n",
+            "  \"a\": 20\n",
+            "  // standalone before trailing comma\n",
+            "  , // inline on trailing comma\n",
+            "\n",
+            "  // standalone after trailing comma\n",
+            "}\n",
+        );
+        let expected_obj_stream = concat!(
+            "{\n",
+            "  \"z\": 10,\n",
+            "\n",
+            "  // lead on a\n",
+            "  \"a\": 20 // inline on trailing comma\n",
+            "\n",
+            "  // standalone before trailing comma\n",
+            "  // standalone after trailing comma\n",
+            "}\n",
+        );
+        let expected_obj_sorted = concat!(
+            "{\n",
+            "  // lead on a\n",
+            "  \"a\": 20, // inline on trailing comma\n",
+            "  \"z\": 10\n",
+            "\n",
+            "  // standalone before trailing comma\n",
+            "  // standalone after trailing comma\n",
+            "}\n",
+        );
+
+        let fixed_s =
+            String::from_utf8(format_json(obj_trailing.as_bytes(), &fix_stream).unwrap()).unwrap();
+        assert_eq!(fixed_s, expected_obj_stream);
+        assert!(lint_json(fixed_s.as_bytes()).is_ok());
+        assert_eq!(fmt_default(&fixed_s).unwrap(), expected_obj_stream);
+
+        let fixed_k =
+            String::from_utf8(format_json(obj_trailing.as_bytes(), &fix_sorted).unwrap()).unwrap();
+        assert_eq!(fixed_k, expected_obj_sorted);
+        assert!(lint_json(fixed_k.as_bytes()).is_ok());
+        assert_eq!(fmt_default(&fixed_k).unwrap(), expected_obj_sorted);
+        assert_eq!(
+            String::from_utf8(format_json(fixed_k.as_bytes(), &plain_sorted).unwrap()).unwrap(),
+            expected_obj_sorted
+        );
+
+        // 2. Array trailing comma with all combinations: no-before + after, inline+standalone before + inline+standalone after
+        let arr_cases = [
+            (
+                "[\n  1, // inline after\n  // footer 1\n\n  // footer 2\n]\n",
+                "[\n  1 // inline after\n\n  // footer 1\n  // footer 2\n]\n",
+            ),
+            (
+                "[\n  1 /* ib */\n  // sb\n  , /* ia */\n  // sa\n]\n",
+                "[\n  1 /* ib */ /* ia */\n\n  // sb\n  // sa\n]\n",
+            ),
+        ];
+        for (raw, expected) in arr_cases {
+            assert!(fmt_default(raw).is_err());
+            let out_stream =
+                String::from_utf8(format_json(raw.as_bytes(), &fix_stream).unwrap()).unwrap();
+            let out_sorted =
+                String::from_utf8(format_json(raw.as_bytes(), &fix_sorted).unwrap()).unwrap();
+            assert_eq!(out_stream, expected);
+            assert_eq!(out_sorted, expected);
+            assert!(lint_json(out_stream.as_bytes()).is_ok());
+            assert_eq!(fmt_default(&out_stream).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_adversarial_arrays_with_comments_vs_inline_scalar_arrays() {
+        let sort_opts = FormatOptions {
+            sort_keys: true,
+            ..FormatOptions::default()
+        };
+        let structural_opts = FormatOptions {
+            line_width: 0,
+            ..FormatOptions::default()
+        };
+        let structural_sort_opts = FormatOptions {
+            line_width: 0,
+            sort_keys: true,
+            ..FormatOptions::default()
+        };
+
+        // 1. `[1,\n// c\n2]` vs `[// lead\n1, 2]` vs width-aware inline `[1, 2] // inline`
+        //    followed by standalone comment on next sibling in both object and 2D nested array.
+        let doc = concat!(
+            "{\n",
+            "  \"a_inline\": [1, 2], // inline on scalar array\n",
+            "  // standalone on b_commented\n",
+            "  \"b_commented\": [1,\n",
+            "  // between 1 and 2\n",
+            "  2],\n",
+            "  \"c_lead_comment\": [\n",
+            "    // leading in array\n",
+            "    1, 2\n",
+            "  ],\n",
+            "  \"d_matrix\": [\n",
+            "    [1, 2], // inline row 1\n",
+            "    // standalone before row 2\n",
+            "    [3, 4]\n",
+            "    // matrix footer\n",
+            "  ]\n",
+            "}\n",
+        );
+
+        let expected_width_aware = concat!(
+            "{\n",
+            "  \"a_inline\": [1, 2], // inline on scalar array\n",
+            "\n",
+            "  // standalone on b_commented\n",
+            "  \"b_commented\": [\n",
+            "    1,\n",
+            "\n",
+            "    // between 1 and 2\n",
+            "    2\n",
+            "  ],\n",
+            "  \"c_lead_comment\": [\n",
+            "    // leading in array\n",
+            "    1,\n",
+            "    2\n",
+            "  ],\n",
+            "  \"d_matrix\": [\n",
+            "    [1, 2], // inline row 1\n",
+            "\n",
+            "    // standalone before row 2\n",
+            "    [3, 4]\n",
+            "\n",
+            "    // matrix footer\n",
+            "  ]\n",
+            "}\n",
+        );
+
+        let stream_out = fmt_default(doc).unwrap();
+        let sorted_out =
+            String::from_utf8(format_json(doc.as_bytes(), &sort_opts).unwrap()).unwrap();
+        assert_eq!(stream_out, expected_width_aware);
+        assert_eq!(sorted_out, expected_width_aware);
+        assert_eq!(fmt_default(&stream_out).unwrap(), expected_width_aware);
+
+        // 2. `--structural` (`line_width: 0`) expands `[1, 2]` and `[3, 4]` while keeping
+        //    identical standalone comment blank-line placement across streaming and `--sort-keys`.
+        let struct_stream =
+            String::from_utf8(format_json(doc.as_bytes(), &structural_opts).unwrap()).unwrap();
+        let struct_sorted =
+            String::from_utf8(format_json(doc.as_bytes(), &structural_sort_opts).unwrap()).unwrap();
+        assert_eq!(struct_stream, struct_sorted);
+        assert!(struct_stream.contains("\"a_inline\": [\n    1,\n    2\n  ], // inline on scalar array\n\n  // standalone on b_commented"));
+        assert_eq!(
+            String::from_utf8(format_json(struct_stream.as_bytes(), &structural_opts).unwrap())
+                .unwrap(),
+            struct_stream
+        );
     }
 }

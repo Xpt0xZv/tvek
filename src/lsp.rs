@@ -2271,4 +2271,239 @@ mod tests {
             .unwrap();
         assert!(valid_actions.is_empty());
     }
+
+    #[test]
+    fn test_lsp_formatting_jsonc_blank_lines_and_idempotency() {
+        let raw_doc = concat!(
+            "// File header\n",
+            "{\n",
+            "  // First key comment\n",
+            "  \"a\": [1, 2], // inline a\n",
+            "  // Second key group 1\n",
+            "\n",
+            "  // Second key group 2\n",
+            "  \"b\": [\n",
+            "    10,\n",
+            "    /* before 20 */\n",
+            "    20\n",
+            "    // end of b\n",
+            "  ]\n",
+            "  // end of root\n",
+            "} // inline root\n",
+            "// EOF footer\n",
+        );
+        let expected_formatted = concat!(
+            "// File header\n",
+            "{\n",
+            "  // First key comment\n",
+            "  \"a\": [1, 2], // inline a\n",
+            "\n",
+            "  // Second key group 1\n",
+            "  // Second key group 2\n",
+            "  \"b\": [\n",
+            "    10,\n",
+            "\n",
+            "    /* before 20 */\n",
+            "    20\n",
+            "\n",
+            "    // end of b\n",
+            "  ]\n",
+            "\n",
+            "  // end of root\n",
+            "} // inline root\n",
+            "\n",
+            "// EOF footer\n",
+        );
+
+        let mut esc_raw = String::new();
+        escape_json_string(raw_doc, &mut esc_raw);
+        let mut esc_formatted = String::new();
+        escape_json_string(expected_formatted, &mut esc_formatted);
+
+        let mut stream = String::new();
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        ));
+        stream.push_str(&frame_msg(&format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///cfg.jsonc","languageId":"jsonc","version":1,"text":"{}"}}}}}}"#,
+            esc_raw
+        )));
+        // 1. Format unformatted JSONC document -> returns single full-document TextEdit
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///cfg.jsonc"},"options":{"tabSize":2,"insertSpaces":true}}}"#,
+        ));
+        // 2. Apply formatted text via didChange and format again -> returns `[]` (idempotent no-op)
+        stream.push_str(&frame_msg(&format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"file:///cfg.jsonc","version":2}},"contentChanges":[{{"text":"{}"}}]}}}}"#,
+            esc_formatted
+        )));
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///cfg.jsonc"},"options":{"tabSize":2,"insertSpaces":true}}}"#,
+        ));
+
+        let mut reader = Cursor::new(stream.into_bytes());
+        let mut writer = Vec::new();
+        let _ = run_server_loop(&mut reader, &mut writer, LspConfig::default()).unwrap();
+
+        let frames = read_all_frames(&writer);
+        // Frame 0: initialize, Frame 1: didOpen diag, Frame 2: formatting #1, Frame 3: didChange diag, Frame 4: formatting #2
+        assert_eq!(frames.len(), 5);
+
+        let first_edits = frames[2]
+            .get_field("result")
+            .and_then(|r| r.as_array())
+            .unwrap();
+        assert_eq!(first_edits.len(), 1);
+        assert_eq!(
+            first_edits[0].get_field("newText").and_then(|v| v.as_str()),
+            Some(expected_formatted)
+        );
+
+        let second_edits = frames[4]
+            .get_field("result")
+            .and_then(|r| r.as_array())
+            .unwrap();
+        assert!(
+            second_edits.is_empty(),
+            "Second textDocument/formatting on already-formatted JSONC must return []"
+        );
+    }
+
+    #[test]
+    fn test_lsp_code_action_and_tab_formatting_jsonc_blank_lines_convergence() {
+        let broken_jsonc = concat!(
+            "\u{FEFF}// header\n",
+            "{\n",
+            "  \"b\": [1, 2,], // inline on b\n",
+            "  // group 1\n",
+            "\n",
+            "  // group 2\n",
+            "  \"a\": 10 /* before comma */, // after comma\n",
+            "  // obj footer\n",
+            "}\n",
+            "// eof\n",
+        );
+        let expected_fixed = concat!(
+            "// header\n",
+            "{\n",
+            "  // group 1\n",
+            "  // group 2\n",
+            "  \"a\": 10, /* before comma */ // after comma\n",
+            "  \"b\": [1, 2] // inline on b\n",
+            "\n",
+            "  // obj footer\n",
+            "}\n",
+            "\n",
+            "// eof\n",
+        );
+        let expected_tabs = concat!(
+            "// header\n",
+            "{\n",
+            "\t// group 1\n",
+            "\t// group 2\n",
+            "\t\"a\": 10, /* before comma */ // after comma\n",
+            "\t\"b\": [1, 2] // inline on b\n",
+            "\n",
+            "\t// obj footer\n",
+            "}\n",
+            "\n",
+            "// eof\n",
+        );
+
+        let mut esc_broken = String::new();
+        escape_json_string(broken_jsonc, &mut esc_broken);
+        let mut esc_fixed = String::new();
+        escape_json_string(expected_fixed, &mut esc_fixed);
+        let mut esc_tabs = String::new();
+        escape_json_string(expected_tabs, &mut esc_tabs);
+
+        let mut stream = String::new();
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"initializationOptions":{"sortKeys":true}}}"#,
+        ));
+        stream.push_str(&frame_msg(&format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"file:///fix.jsonc","languageId":"jsonc","version":1,"text":"{}"}}}}}}"#,
+            esc_broken
+        )));
+        // 1. Request quickfix codeAction -> repairs BOM + trailing commas, sorts keys, and emits canonical comment blank lines
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file:///fix.jsonc"},"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"context":{"diagnostics":[]}}}"#,
+        ));
+        // 2. Apply fixed text via didChange -> diagnostics clear, and 2-space formatting is an idempotent no-op (`[]`)
+        stream.push_str(&frame_msg(&format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"file:///fix.jsonc","version":2}},"contentChanges":[{{"text":"{}"}}]}}}}"#,
+            esc_fixed
+        )));
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":3,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///fix.jsonc"},"options":{"tabSize":2,"insertSpaces":true}}}"#,
+        ));
+        // 3. Reformat with `insertSpaces: false` (tabs) -> blank lines remain strictly empty (`\n\n\t// obj footer`)
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":4,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///fix.jsonc"},"options":{"tabSize":4,"insertSpaces":false}}}"#,
+        ));
+        stream.push_str(&frame_msg(&format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"file:///fix.jsonc","version":3}},"contentChanges":[{{"text":"{}"}}]}}}}"#,
+            esc_tabs
+        )));
+        stream.push_str(&frame_msg(
+            r#"{"jsonrpc":"2.0","id":5,"method":"textDocument/formatting","params":{"textDocument":{"uri":"file:///fix.jsonc"},"options":{"tabSize":4,"insertSpaces":false}}}"#,
+        ));
+
+        let mut reader = Cursor::new(stream.into_bytes());
+        let mut writer = Vec::new();
+        let _ = run_server_loop(&mut reader, &mut writer, LspConfig::default()).unwrap();
+
+        let frames = read_all_frames(&writer);
+        // 0: init, 1: didOpen diag, 2: codeAction, 3: didChange diag, 4: fmt spaces, 5: fmt tabs #1, 6: didChange diag, 7: fmt tabs #2
+        assert_eq!(frames.len(), 8);
+
+        let actions = frames[2]
+            .get_field("result")
+            .and_then(|r| r.as_array())
+            .unwrap();
+        assert_eq!(actions.len(), 1);
+        let edit_text = actions[0]
+            .get_field("edit")
+            .and_then(|e| e.get_field("changes"))
+            .and_then(|c| c.get_field("file:///fix.jsonc"))
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(|e| e.get_field("newText"))
+            .and_then(|v| v.as_str());
+        assert_eq!(edit_text, Some(expected_fixed));
+
+        let clear_diags = frames[3]
+            .get_field("params")
+            .and_then(|p| p.get_field("diagnostics"))
+            .and_then(|d| d.as_array())
+            .unwrap();
+        assert!(clear_diags.is_empty());
+
+        let space_fmt_edits = frames[4]
+            .get_field("result")
+            .and_then(|r| r.as_array())
+            .unwrap();
+        assert!(
+            space_fmt_edits.is_empty(),
+            "Formatting after codeAction must return [] without drift"
+        );
+
+        let tab_fmt_edits = frames[5]
+            .get_field("result")
+            .and_then(|r| r.as_array())
+            .unwrap();
+        assert_eq!(tab_fmt_edits.len(), 1);
+        assert_eq!(
+            tab_fmt_edits[0]
+                .get_field("newText")
+                .and_then(|v| v.as_str()),
+            Some(expected_tabs)
+        );
+
+        let tab_fmt_second = frames[7]
+            .get_field("result")
+            .and_then(|r| r.as_array())
+            .unwrap();
+        assert!(tab_fmt_second.is_empty());
+    }
 }

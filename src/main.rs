@@ -1858,4 +1858,104 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_cli_check_and_write_jsonc_comment_blank_lines_idempotency() {
+        let dir = create_temp_test_dir("cli_jsonc_blank_lines");
+
+        // Case A: Missing blank line above standalone comment after preceding entry
+        let missing_blank = dir.join("missing_blank.jsonc");
+        fs::write(
+            &missing_blank,
+            b"{\n  \"a\": 1,\n  // standalone\n  \"b\": 2\n}\n",
+        )
+        .unwrap();
+
+        // Case B: Extra blank line between consecutive `//` comments
+        let extra_between = dir.join("extra_between.jsonc");
+        fs::write(
+            &extra_between,
+            b"{\n  \"a\": 1,\n\n  // c1\n\n  // c2\n  \"b\": 2\n}\n",
+        )
+        .unwrap();
+
+        // Case C: Whitespace-polluted blank line (`"  \n"`) above standalone comment
+        let dirty_blank = dir.join("dirty_blank.jsonc");
+        fs::write(
+            &dirty_blank,
+            b"{\n  \"a\": 1,\n  \n  // standalone\n  \"b\": 2\n}\n",
+        )
+        .unwrap();
+
+        let cfg_check = CliConfig {
+            check: true,
+            quiet: true,
+            ..CliConfig::default()
+        };
+        let cfg_write = CliConfig {
+            write: true,
+            quiet: true,
+            ..CliConfig::default()
+        };
+
+        // 1. `--check` must flag each non-canonical JSONC file (`has_lint_or_check_err == true`)
+        for path in [&missing_blank, &extra_between, &dirty_blank] {
+            let check_err = AtomicBool::new(false);
+            let io_err = AtomicBool::new(false);
+            process_file_batch(std::slice::from_ref(path), &cfg_check, &check_err, &io_err);
+            assert!(
+                check_err.load(Ordering::Relaxed),
+                "--check must fail on non-canonical {:?}",
+                path
+            );
+            assert!(!io_err.load(Ordering::Relaxed));
+        }
+
+        // 2. `--write` formats all three files in-place atomically
+        let batch = vec![
+            missing_blank.clone(),
+            extra_between.clone(),
+            dirty_blank.clone(),
+        ];
+        let write_err = AtomicBool::new(false);
+        let io_err = AtomicBool::new(false);
+        process_file_batch(&batch, &cfg_write, &write_err, &io_err);
+        assert!(!write_err.load(Ordering::Relaxed));
+        assert!(!io_err.load(Ordering::Relaxed));
+
+        let expected_single = "{\n  \"a\": 1,\n\n  // standalone\n  \"b\": 2\n}\n";
+        let expected_group = "{\n  \"a\": 1,\n\n  // c1\n  // c2\n  \"b\": 2\n}\n";
+        assert_eq!(
+            String::from_utf8(fs::read(&missing_blank).unwrap()).unwrap(),
+            expected_single
+        );
+        assert_eq!(
+            String::from_utf8(fs::read(&dirty_blank).unwrap()).unwrap(),
+            expected_single
+        );
+        assert_eq!(
+            String::from_utf8(fs::read(&extra_between).unwrap()).unwrap(),
+            expected_group
+        );
+
+        // 3. Subsequent `--check` succeeds (`has_lint_or_check_err == false`)
+        let recheck_err = AtomicBool::new(false);
+        process_file_batch(&batch, &cfg_check, &recheck_err, &io_err);
+        assert!(!recheck_err.load(Ordering::Relaxed));
+        assert!(!io_err.load(Ordering::Relaxed));
+
+        // 4. Subsequent `--write` is idempotent and leaves exact file contents intact
+        process_file_batch(&batch, &cfg_write, &write_err, &io_err);
+        assert!(!write_err.load(Ordering::Relaxed));
+        assert_eq!(
+            String::from_utf8(fs::read(&missing_blank).unwrap()).unwrap(),
+            expected_single
+        );
+        assert_eq!(
+            String::from_utf8(fs::read(&extra_between).unwrap()).unwrap(),
+            expected_group
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
